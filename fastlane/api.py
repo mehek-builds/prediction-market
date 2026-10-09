@@ -3,7 +3,7 @@
     uvicorn fastlane.api:app --port 8787
 
 GET /trades  -> every paper trade with its trigger, decision timings, live sell price, P&L and price path since entry.
-GET /decisions, /status, /settings, /health, /control/state -> read-only views of the ledger and the engine state.
+GET /decisions, /status, /settings, /health, /working, /control/state -> read-only views of the ledger and the engine state.
 POST /settings/shadow -> toggles shadow mode at runtime (see README).
 POST /control/mode -> the paper / real-money switch (localhost only, see fastlane/live.py).
 
@@ -29,7 +29,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from fastlane import errors, live
 from fastlane.books import fetch_book, taker_fee_per_contract
-from fastlane.decision import BUCKET_EDGES, strength_bucket
+from fastlane.decision import BUCKET_EDGES, entry_styles, starter_settings, strength_bucket
 from fastlane.ledger import DB_PATH, SCHEMA, SETTINGS_DDL, columns, mark_key, shadow_enabled_from, utc_day
 from fastlane.ratelimit import RateLimitMiddleware
 from fastlane.universe import CACHE
@@ -122,7 +122,7 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
 
 
-BookName = Literal["all", "live", "shadow", "test"]
+BookName = Literal["all", "live", "shadow", "starter", "test"]
 
 
 @app.get("/trades")
@@ -137,6 +137,11 @@ async def trades(include_synthetic: bool = True, book: BookName = "all"):
 def _opt(r: sqlite3.Row, name: str, default=None):
     """Optional column: a ledger from before 0.2.0 has not been migrated yet (the engine migrates on start)."""
     return r[name] if name in r.keys() else default
+
+
+def _book_of(r: sqlite3.Row) -> str:
+    """live | shadow | starter. Rows from before 0.5.0 (or a ledger not yet migrated) have no `book`: shadow flag decides."""
+    return _opt(r, "book") or ("shadow" if _opt(r, "shadow", 0) else "live")
 
 
 def _agg(ts: list[dict]) -> dict:
@@ -173,8 +178,9 @@ async def _trades(db: sqlite3.Connection, include_synthetic: bool, book: str = "
         ORDER BY t.opened_ts DESC""").fetchall()
     # Filter before fetching order books so excluded rows cost no HTTP.
     keep = {"all": lambda r: True,
-            "live": lambda r: not r["synthetic"] and not _opt(r, "shadow", 0),
-            "shadow": lambda r: bool(_opt(r, "shadow", 0)),
+            "live": lambda r: not r["synthetic"] and _book_of(r) == "live",
+            "shadow": lambda r: _book_of(r) == "shadow",
+            "starter": lambda r: _book_of(r) == "starter",
             "test": lambda r: bool(r["synthetic"])}[book]
     rows = [r for r in rows if keep(r)]
 
@@ -185,11 +191,12 @@ async def _trades(db: sqlite3.Connection, include_synthetic: bool, book: str = "
     out = []
     for r in rows:
         side, n = r["side"], r["contracts"]
-        is_shadow = bool(_opt(r, "shadow", 0))
+        book_name = _book_of(r)
+        is_shadow = book_name == "shadow"
         strength_sig = _opt(r, "signal_strength")
         path = [{"ts": r["opened_ts"], "price": r["avg_price"]}]
         for m in db.execute("SELECT ts, yes_bid, yes_ask FROM marks WHERE event_id = ? AND horizon_s > 0 ORDER BY ts",
-                            (mark_key(r["event_id"], is_shadow),)):
+                            (mark_key(r["event_id"], book_name),)):
             p = _held_bid(side, m["yes_bid"], m["yes_ask"])
             if p is not None:
                 path.append({"ts": m["ts"], "price": p})
@@ -209,7 +216,9 @@ async def _trades(db: sqlite3.Connection, include_synthetic: bool, book: str = "
         pnl = value - r["cost"] - r["fee"] if value is not None else None
         out.append({
             "id": r["id"], "event_id": r["event_id"], "synthetic": bool(r["synthetic"]),
-            "shadow": is_shadow, "signal_strength": strength_sig, "signal_decisive": _opt(r, "signal_decisive"),
+            "shadow": is_shadow, "book": book_name, "entry_style": _opt(r, "entry_style") or "take",
+            "order_id": _opt(r, "order_id"), "limit_price": _opt(r, "limit_price"),
+            "signal_strength": strength_sig, "signal_decisive": _opt(r, "signal_decisive"),
             "bucket": strength_bucket(strength_sig),
             "venue": r["venue"], "market_id": r["market_id"], "question": r["market_question"],
             "side": side, "contracts": n, "entry_price": r["avg_price"], "best_ask_at_entry": r["best_ask"],
@@ -225,16 +234,19 @@ async def _trades(db: sqlite3.Connection, include_synthetic: bool, book: str = "
                          "decided_ts": r["decided_ts"]},
         })
 
-    real = [t for t in out if not t["shadow"]]           # the real paper book: live + test, as before 0.2.0
+    real = [t for t in out if t["book"] == "live"]       # the real paper book: live + test, as before 0.2.0
     live = [t for t in real if not t["synthetic"]]
-    shadow = [t for t in out if t["shadow"]]
+    shadow = [t for t in out if t["book"] == "shadow"]
+    starter = [t for t in out if t["book"] == "starter"]
     test = [t for t in real if t["synthetic"]]
     ms = sorted(t["decision"]["total_ms"] for t in real if t["decision"]["total_ms"])
     summary = {
-        "trades": len(out), "live_trades": len(live), "shadow_trades": len(shadow), "test_trades": len(test),
+        "trades": len(out), "live_trades": len(live), "shadow_trades": len(shadow), "starter_trades": len(starter),
+        "test_trades": len(test),
         **{k: v for k, v in _agg(real).items() if k != "trades"},  # invested, value, pnl, winners, losers: real book
         "median_decision_ms": ms[len(ms) // 2] if ms else None,
-        "books": {"live": _agg(live), "shadow": {**_agg(shadow), "buckets": _buckets(shadow)}, "test": _agg(test)},
+        "books": {"live": _agg(live), "shadow": {**_agg(shadow), "buckets": _buckets(shadow)},
+                  "starter": _agg(starter), "test": _agg(test)},
         "as_of": now,
     }
     return {"summary": summary, "trades": out}
@@ -252,14 +264,18 @@ async def decisions(limit: int = 40):
 
 
 def _decisions(db: sqlite3.Connection, limit: int) -> dict:
-    have = {"shadow_action", "shadow_reason", "shadow_market_id"} <= columns(db, "decisions")
+    have_cols = columns(db, "decisions")
+    have = {"shadow_action", "shadow_reason", "shadow_market_id"} <= have_cols
     shadow_cols = ("d.shadow_action, d.shadow_reason, d.shadow_market_id" if have else
                    "NULL AS shadow_action, NULL AS shadow_reason, NULL AS shadow_market_id")
+    # 0.5.0 columns: a ledger opened read-only before the engine migrated it does not have them yet
+    new_cols = ", ".join(f"d.{c}" if c in have_cols else f"NULL AS {c}" for c in (
+        "starter_action", "starter_reason", "starter_market_id", "quote_wait_ms", "n_live_quotes"))
     rows = db.execute(f"""
         SELECT e.id, e.headline, e.source, e.url, e.published_ts, e.seen_ts,
                d.decided_ts, d.total_ms, d.jev_ms, d.shortlist_ms, d.book_ms, d.n_candidates, d.action, d.reason, d.venue, d.market_id, d.market_question,
                d.market_conf AS strength, d.p_up, d.p_down, d.materiality AS p_decisive, d.mid_at_decision,
-               {shadow_cols}
+               {shadow_cols}, {new_cols}
         FROM events e JOIN decisions d ON d.event_id = e.id
         WHERE e.synthetic = 0
         ORDER BY d.decided_ts DESC LIMIT ?""", (limit,)).fetchall()
@@ -300,9 +316,45 @@ def _decisions(db: sqlite3.Connection, limit: int) -> dict:
             "after_costs_cents": after, "after_costs_horizon_s": last["horizon_s"] if after is not None else None,
             "shadow_action": r["shadow_action"], "shadow_reason": r["shadow_reason"],
             "shadow_market_id": r["shadow_market_id"],
-            "shadow_traded": r["shadow_reason"] in ("signal_yes", "signal_no"),
+            "shadow_traded": r["shadow_reason"] in ("signal_yes", "signal_no", "post_working"),
+            "starter_action": r["starter_action"], "starter_reason": r["starter_reason"],
+            "starter_market_id": r["starter_market_id"],
+            "starter_traded": r["starter_reason"] in ("signal_yes", "signal_no", "post_working"),
+            "quote_wait_ms": r["quote_wait_ms"], "n_live_quotes": r["n_live_quotes"],
         })
     return {"decisions": out}
+
+
+@app.get("/working")
+async def working():
+    """Resting paper orders (ENTRY_STYLE=post): the working ones, and the ones that closed in the last 24 hours."""
+    db = _db()
+    try:
+        return _working(db)
+    finally:
+        db.close()
+
+
+WORKING_FIELDS = ("id", "book", "venue", "market_id", "side", "limit_price", "take_price", "requested", "filled", "status",
+                  "created_ts", "expires_ts", "closed_ts", "event_id")
+
+
+def _working(db: sqlite3.Connection) -> dict:
+    if "status" not in columns(db, "paper_orders"):   # a ledger from before 0.5.0 has no such table
+        return {"working": [], "recent": []}
+    base = ("SELECT o.*, o.market_question AS question, e.headline AS headline, e.source AS source "
+            "FROM paper_orders o LEFT JOIN events e ON e.id = o.event_id ")
+
+    def shape(r: sqlite3.Row) -> dict:
+        d = {k: r[k] for k in WORKING_FIELDS}
+        d.update(question=r["question"], headline=r["headline"], source=r["source"], style=r["style"], note=r["note"])
+        return d
+
+    work = db.execute(base + "WHERE o.status = 'working' ORDER BY o.created_ts").fetchall()
+    recent = db.execute(base + "WHERE o.status != 'working' AND COALESCE(o.closed_ts, o.updated_ts, o.created_ts) > ? "
+                        "ORDER BY COALESCE(o.closed_ts, o.updated_ts, o.created_ts) DESC LIMIT 50",
+                        (time.time() - 86400,)).fetchall()
+    return {"working": [shape(r) for r in work], "recent": [shape(r) for r in recent]}
 
 
 @app.get("/health")
@@ -417,7 +469,12 @@ async def settings():
         return JSONResponse({"detail": "ledger busy, try again"}, status_code=503)
     finally:
         db.close()
-    return {"shadow_enabled": enabled, "source": source}
+    try:
+        styles = entry_styles()
+    except ValueError:      # a typo in ENTRY_STYLE_*: the engine refuses to start on it; the dashboard shows nothing
+        styles = None
+    return {"shadow_enabled": enabled, "source": source, "starter_enabled": starter_settings()[0],
+            "entry_styles": styles}
 
 
 CONTROL_HEADER = "x-fastlane-control"   # custom header: a cross-site page cannot send it without a CORS preflight,

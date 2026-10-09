@@ -52,6 +52,10 @@ def _event(age_s=5, **kw):
 
 def _make_engine(monkeypatch, tmp_path, tiny_universe, book=None):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    # 0.5.0: shadow and starter default to resting orders and the starter book is on; these pre-0.5.0 tests exercise the
+    # take path and the real/shadow books only (the new behaviour is covered in test_orders.py and test_starter.py).
+    monkeypatch.setenv("ENTRY_STYLE", "take")
+    monkeypatch.setenv("STARTER_ENABLED", "false")
     path = tmp_path / "ledger.db"
     monkeypatch.setattr(engine_mod, "Ledger", lambda: Ledger(path))
     e = engine_mod.Engine(workers=1, verbose=False)
@@ -167,10 +171,11 @@ def test_stale_news_is_blocked_without_trade(eng):
     assert _trades(eng) == []
 
 
-def test_no_room_signal_is_pass_priced_in_without_trade(eng):
-    for m in eng.universe.markets:
-        if m["id"] == "AVNT-1":
-            m["yes_ask"], m["yes_bid"] = .97, .96   # YES already near certainty; fake book (.55) would otherwise fill
+def test_no_room_signal_is_pass_priced_in_without_trade(monkeypatch, tmp_path, tiny_universe):
+    # 0.5.0: room comes from the live book, so the book itself says YES is near certainty (the cache alone no longer decides)
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe,
+                     book=lambda mid: Book("kalshi", mid, [(.97, 1000)], [(.04, 1000)]))
+    eng = e
     rec = _run(eng, _event())
     assert (rec["action"], rec["reason"]) == ("PASS", "priced_in")
     assert rec["market_id"] == "AVNT-1"           # the market is still chosen and tracked
@@ -387,9 +392,9 @@ def test_shadow_exception_is_logged_not_raised(eng, monkeypatch, capsys):
     real_decide = engine_mod.decide
 
     def flaky(answers, keyed=None, **kw):
-        if kw:                      # only the shadow call passes thresholds
+        if kw.get("signal_threshold") is not None:   # only the shadow call passes thresholds (the real call passes quotes)
             raise RuntimeError("shadow bug")
-        return real_decide(answers, keyed)
+        return real_decide(answers, keyed, **kw)
 
     monkeypatch.setattr(engine_mod, "decide", flaky)
     rec = _run(eng, _event())
@@ -703,3 +708,125 @@ def test_transient_setting_read_error_keeps_previous_value(eng, monkeypatch):
     monkeypatch.setattr(engine_mod, "shadow_enabled_from", locked)
     eng._shadow_checked_ts = 0.0
     assert eng.shadow_enabled is False         # previous cached value, not the env default
+
+
+# ---------- v0.5.0: live quotes decide the market, bounded wait ----------
+def _avnt2(universe, ask=.80):
+    a = {"venue": "kalshi", "id": "AVNT-2", "question": "Avient quarterly earnings beat estimates", "category": "Companies",
+         "yes_ask": ask, "yes_bid": ask - .02, "volume_24h": 200}
+    universe._set(universe.markets + [a])
+
+
+def _decisive_both(questions):
+    return {k: {"probabilities": ({"decisive_yes": .8, "toward_yes": .15, "no_signal": .05} if "Avient" in q["instructions"]
+                                  else {"no_signal": 1.0})} for k, q in questions.items()}
+
+
+class SlowJev(FakeJev):
+    """Jev that takes a moment, so the prefetched books have time to land before the live-quote step."""
+    async def decide(self, state, questions):
+        await asyncio.sleep(0.05)
+        return await super().decide(state, questions)
+
+
+def test_live_book_beats_cached_price_in_selection(monkeypatch, tmp_path, tiny_universe):
+    tiny_universe.markets[3]["yes_ask"] = .40     # cache says AVNT-1 is cheap...
+    _avnt2(tiny_universe, .80)                    # ...and AVNT-2 expensive; live books say the opposite
+    live_books = {"AVNT-1": Book("kalshi", "AVNT-1", [(.97, 1000)], [(.04, 1000)]),
+                  "AVNT-2": Book("kalshi", "AVNT-2", [(.55, 1000)], [(.47, 1000)])}
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe, book=lambda mid: live_books[mid])
+    e.jev = SlowJev(_decisive_both)
+    rec = _run(e, _event())
+    assert (rec["action"], rec["reason"], rec["market_id"]) == ("BUY_YES", "signal_yes", "AVNT-2")
+    assert _trades(e) == [("AVNT-2", "yes", 0)]
+    assert rec["n_live_quotes"] == 2
+
+
+def test_decision_row_has_quote_wait_and_live_quote_count(eng):
+    eng.jev = SlowJev(_answers_for())
+    rec = _run(eng, _event())
+    row = eng.ledger.db.execute("SELECT quote_wait_ms, n_live_quotes FROM decisions WHERE event_id='ev1'").fetchone()
+    assert row[1] == rec["n_live_quotes"] >= 1 and row[0] == pytest.approx(rec["quote_wait_ms"])
+    assert row[0] >= 0
+
+
+def _slow_setup(monkeypatch, tmp_path, tiny_universe, wait_ms=None, probs=None):
+    """AVNT-1 lands at once; AVNT-2 takes 1 s. Returns (engine, {market_id: fetch task})."""
+    if wait_ms is not None:
+        monkeypatch.setenv("LIVE_QUOTE_WAIT_MS", str(wait_ms))
+    _avnt2(tiny_universe, .80)
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe)
+    e.jev = SlowJev(_answers_for(probs=probs))
+    tasks = {}
+
+    async def fake(client, market):
+        tasks[market["id"]] = asyncio.current_task()
+        if market["id"] == "AVNT-2":
+            await asyncio.sleep(1.0)
+        return Book("kalshi", market["id"], [(.55, 1000)], [(.47, 1000)])
+    monkeypatch.setattr(engine_mod, "fetch_book", fake)
+    return e, tasks
+
+
+def test_bounded_quote_wait_does_not_block_on_a_slow_book(monkeypatch, tmp_path, tiny_universe):
+    e, _ = _slow_setup(monkeypatch, tmp_path, tiny_universe)
+    assert e.quote_wait_s == pytest.approx(.150)
+    t0 = time.perf_counter()
+    rec = _run(e, _event())
+    assert time.perf_counter() - t0 < 0.9              # the 1 s fetch was not awaited (loose bound, slow CI tolerated)
+    assert rec["action"] == "BUY_YES" and rec["market_id"] == "AVNT-1"
+    assert rec["n_live_quotes"] == 1 and rec["quote_wait_ms"] <= 400
+
+
+def test_quote_wait_zero_uses_only_finished_books(monkeypatch, tmp_path, tiny_universe):
+    e, _ = _slow_setup(monkeypatch, tmp_path, tiny_universe, wait_ms=0)
+    assert e.quote_wait_s == 0
+    rec = _run(e, _event())
+    assert rec["n_live_quotes"] == 1 and rec["quote_wait_ms"] < 100
+    assert rec["market_id"] == "AVNT-1"
+
+
+def test_slow_book_survives_until_side_books_finish_and_stop_cancels_it(monkeypatch, tmp_path, tiny_universe):
+    e, tasks = _slow_setup(monkeypatch, tmp_path, tiny_universe, probs=LEAN)    # real PASS: shadow and starter run
+
+    async def go():
+        rec = await e.handle(_event())
+        assert rec["reason"] == "lean_not_decisive" and rec["n_live_quotes"] == 1
+        slow = tasks["AVNT-2"]
+        assert not slow.done() and not slow.cancelled()      # still held for the side books
+        await e.stop()
+        assert slow.cancelled()
+    asyncio.run(go())
+
+
+def test_slow_book_is_cancelled_once_the_side_books_finish(monkeypatch, tmp_path, tiny_universe):
+    e, tasks = _slow_setup(monkeypatch, tmp_path, tiny_universe, probs=LEAN)
+
+    async def go():
+        await e.handle(_event())
+        await e.drain_shadow()
+        await e.drain_starter()
+        await asyncio.sleep(0)
+        assert tasks["AVNT-2"].cancelled()
+        await e.stop()
+    asyncio.run(go())
+
+
+def test_live_book_with_no_ask_is_pass_no_fill_within_limit(monkeypatch, tmp_path, tiny_universe):
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe, book=lambda mid: Book("kalshi", mid, [], [(.47, 1000)]))
+    e.jev = SlowJev(_answers_for())
+    rec = _run(e, _event())
+    assert (rec["action"], rec["reason"]) == ("PASS", "no_fill_within_limit") and _trades(e) == []
+
+
+def test_cached_cheap_market_with_a_live_book_at_97c_is_priced_in(monkeypatch, tmp_path, tiny_universe):
+    tiny_universe.markets[3]["yes_ask"] = .40
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe, book=lambda mid: Book("kalshi", mid, [(.97, 1000)], [(.04, 1000)]))
+    e.jev = SlowJev(_answers_for())
+    rec = _run(e, _event())
+    assert (rec["action"], rec["reason"]) == ("PASS", "priced_in") and _trades(e) == []
+
+
+def test_status_line_has_starter_and_working_counts(eng):
+    s = eng.status()
+    assert "starter 0" in s and "working 0" in s

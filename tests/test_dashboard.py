@@ -6,7 +6,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 HTML = (ROOT / "fastlane/static/index.html").read_text()
-ALLOWED_PATHS = {"/trades", "/decisions", "/status", "/settings", "/settings/shadow", "/control/state", "/control/mode"}
+ALLOWED_PATHS = {"/trades", "/decisions", "/status", "/settings", "/settings/shadow", "/control/state", "/control/mode", "/working"}
 
 
 def test_no_html_injection_apis():        # textContent only; headlines are third-party text
@@ -98,8 +98,8 @@ def _contrast(a, b):
 @pytest.mark.parametrize("theme", ["dark", "light"])
 def test_tokens_meet_aa(theme):
     t = _tokens(theme)
-    assert {"--bg", "--fg", "--dim", "--rule", "--amber", "--up", "--down", "--cool"} <= set(t)
-    for name in ("--fg", "--dim", "--amber", "--up", "--down", "--cool"):
+    assert {"--bg", "--fg", "--dim", "--rule", "--amber", "--up", "--down", "--cool", "--starter"} <= set(t)
+    for name in ("--fg", "--dim", "--amber", "--up", "--down", "--cool", "--starter"):
         assert _contrast(t[name], t["--bg"]) >= 4.5, (theme, name)
 
 
@@ -238,3 +238,71 @@ def test_masthead_shows_demo_not_live_money_when_armed_on_the_demo_host():
     body = _fn("renderControl")
     assert "armed && c.demo" in body and 'badge.textContent = "DEMO"' in body
     assert body.index('badge.textContent = "DEMO"') < body.index('badge.textContent = "LIVE MONEY"')
+
+
+# ---------- v0.5.0: starter key, WORKING ORDERS panel, new reasons ----------
+def test_key_five_is_the_starter_book_and_the_help_row_lists_it():
+    keymap = re.search(r"const KEYMAP = \{(.*?)\};", HTML, re.S).group(1)
+    assert '"5": "book:starter"' in keymap
+    assert '["1 2 3 4 5", "Show ALL / LIVE / SHADOW / TEST / STARTER trades"]' in HTML
+    for bad in ("mode:", "setMode", "arm"):
+        assert bad not in keymap
+
+
+def test_book_of_reads_the_trade_book_with_a_fallback_for_old_payloads():
+    m = re.search(r"const bookOf = t => \((.*?)\);", HTML)
+    assert m and 't.book || (t.shadow ? "shadow" : "live")' in m.group(1) and "t.synthetic" in m.group(1)
+
+
+def test_starter_is_wired_through_filters_curves_rows_and_cards():
+    assert 'if (state.filter === "starter")' in HTML
+    assert 'starter: ["var(--starter)"' in HTML                                  # P&L curve style
+    assert '.sw.starter { background: var(--starter); }' in HTML                 # legend swatch
+    assert '"STRT"' in HTML and 'chip strt' in HTML
+    assert "Paper starter book: strength >= 0.90, no decisive requirement, $20 a trade" in HTML
+    assert 'filterKey === "starter" && state.settings && state.settings.starter_enabled === false' in HTML
+    assert '" (OFF)"' in HTML
+
+
+def test_new_reasons_have_plain_english_labels():
+    reasons = re.search(r"const REASONS = \{(.*?)\n\};", HTML, re.S).group(1)
+    for key, text in {"post_working": "Resting order placed", "post_expired": "Resting order expired",
+                      "post_queue_full": "Too many working orders", "sports_market": "Sports market",
+                      "release_yes": "Bought YES on data release", "release_no": "Bought NO on data release",
+                      "release_margin": "Too close to the strike", "rules_mismatch": "Market rules not recognised"}.items():
+        assert f'{key}: "{text}"' in reasons, key
+
+
+def test_working_orders_panel_is_read_only_markup_hidden_when_empty():
+    panel = re.search(r'<section id="working".*?</section>', HTML, re.S).group(0)
+    assert "WORKING ORDERS" in panel and " hidden>" in panel.split("\n")[0] or "hidden" in panel.split(">")[0]
+    for col in ("BOOK", "MARKET", "SIDE", "LIMIT", "FILLED/REQ", "AGE", "EXPIRES"):
+        assert f">{col}<" in panel
+    assert "<button" not in panel and "<input" not in panel and "<form" not in panel and "onclick" not in panel.lower()
+    assert 'id="working-rows"' in panel
+    assert HTML.index('id="books-note"') < HTML.index('id="working"') < HTML.index('id="control"')   # under BOOKS
+
+
+def test_working_orders_renderer_uses_text_only():
+    body = _fn("renderWorking")
+    assert "innerHTML" not in body and "insertAdjacentHTML" not in body
+    assert "textContent" in body or "el(" in body or "td(" in body
+    assert "panel.hidden = !(w.working.length || w.recent.length)" in body
+    assert '"data-ts"' in body and "replaceChildren" in body                      # countdown rides the existing ticker
+    assert "createElement" not in body and "button" not in body.lower()
+
+
+def test_load_fetches_working_and_keeps_going_when_it_fails():
+    body = _fn("load")
+    assert 'getJson("/working")' in body and "if (wk) state.working = wk.v" in body
+    assert "starter_enabled: set.v.starter_enabled" in body and "entry_styles: set.v.entry_styles" in body
+    assert "renderWorking()" in _fn("render")
+
+
+def test_starter_decision_chip_and_quote_latency_row_exist():
+    assert '"STRT " +' in HTML and "quote_wait_ms" in HTML and "QUOTES" in HTML
+
+
+def test_post_chip_and_entry_tooltip():
+    assert 'entry_style === "post"' in HTML and "POST" in HTML
+    assert "post fill at limit" in HTML and "take would have been" in HTML

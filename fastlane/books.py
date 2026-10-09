@@ -14,6 +14,7 @@ MAX_SPREAD = 0.03         # skip if getting out costs more than 3 cents of sprea
 COST_TO_ROOM_MAX = 0.25   # skip if round-trip cost (spread + both taker fees) eats over a quarter of the room
                           # to profit (env COST_TO_ROOM_MAX). "If the cost of trading eats the gains, it's not worth it."
 MIN_ENTRY_PRICE = 0.03    # below this a contract is a long shot: tiny room to lose, no realistic exit (env MIN_ENTRY_PRICE)
+TICK = 0.01               # price step of a resting paper bid (Kalshi linear-cent markets; Polymarket quotes finer, we stay on cents)
 COST_BLOCK_REASONS = frozenset({"too_expensive", "no_exit_liquidity", "longshot"})  # market-property blocks: recorded as PASS
 
 
@@ -137,3 +138,47 @@ def simulate_fill(book: Book, side: str, budget_usd: float) -> dict | None:
     fee = kalshi_taker_fee(contracts, avg) if book.venue == "kalshi" else 0.0
     return {"contracts": round(contracts, 2), "avg_price": round(avg, 4), "cost": round(cost, 2),
             "fee": fee, "best_ask": best, "limit": round(limit, 4)}
+
+
+def post_limit(book: Book, side: str, min_entry: float = MIN_ENTRY_PRICE) -> float | None:
+    """Price for a resting buy of `side`: best bid of that side + TICK, but never at or above the best ask (if the spread
+    is one tick, join the bid: L = bid). None when the side has no bid, or when the price would be at or above
+    MAX_ENTRY_PRICE (no room) or below `min_entry` (long shot): the caller reports no_room / longshot."""
+    bid = book.bid(side)
+    if bid is None or bid <= 0:
+        return None
+    ask = book.best(side)
+    limit = round(bid + TICK, 2)
+    if ask is not None and limit >= ask - 1e-9:
+        limit = round(bid, 2)
+    if limit >= MAX_ENTRY_PRICE - 1e-9 or limit < round(min_entry, 4) - 1e-9:
+        return None
+    return limit
+
+
+def post_size(venue: str, limit: float, budget_usd: float) -> float:
+    """Contracts for a resting order: budget / limit. Whole contracts on Kalshi (floor, 0 when under one), floored to two
+    decimals on Polymarket (never above the budget)."""
+    if limit <= 0:
+        return 0.0
+    n = budget_usd / limit
+    if venue == "kalshi":
+        return float(math.floor(n + 1e-9))
+    return math.floor(n * 100 + 1e-9) / 100
+
+
+def post_fill(side: str, limit: float, remaining: float, book: Book, venue: str) -> dict | None:
+    """Fill model for a resting bid (conservative, we are last in the queue at our price): a fill happens only when the
+    OPPOSITE side comes to us, i.e. the best ask of `side` in `book` is at or below `limit`. Quantity is the smaller of
+    `remaining` and the displayed size at ask prices <= limit (whole contracts on Kalshi). The price is our limit,
+    never better. None when nothing fills. Returns {"contracts", "price", "ask_seen", "qty_seen"}."""
+    asks = book.yes_asks if side == "yes" else book.no_asks
+    reachable = [(p, q) for p, q in asks if p <= limit + 1e-9]
+    if not reachable:
+        return None
+    qty_seen = sum(q for _, q in reachable)
+    n = min(remaining, qty_seen)
+    n = float(math.floor(n + 1e-9)) if venue == "kalshi" else math.floor(n * 100 + 1e-9) / 100
+    if n <= 0:
+        return None
+    return {"contracts": n, "price": round(limit, 4), "ask_seen": reachable[0][0], "qty_seen": qty_seen}

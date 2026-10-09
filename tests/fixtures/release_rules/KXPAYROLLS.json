@@ -1,0 +1,159 @@
+{
+ "fetched_ts": 1791577342,
+ "source": "https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=KXPAYROLLS&with_nested_markets=true&status=open&limit=20",
+ "markets": [
+  {
+   "ticker": "KXPAYROLLS-26OCT-T-25000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above -25000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": -25000,
+   "cap_strike": null,
+   "yes_sub_title": "Above -25,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T0",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 0 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 0,
+   "cap_strike": null,
+   "yes_sub_title": "Above 0",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T10000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 10000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 10000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 10,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T20000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 20000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 20000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 20,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T30000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 30000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 30000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 30,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T40000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 40000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 40000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 40,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T50000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 50000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 50000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 50,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T60000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 60000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 60000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 60,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T70000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 70000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 70000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 70,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T80000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 80000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 80000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 80,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T90000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 90000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 90000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 90,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T100000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 100000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 100000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 100,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26OCT-T125000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 125000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 125000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 125,000",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26NOV-T-25000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above -25000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of November 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": -25000,
+   "cap_strike": null,
+   "yes_sub_title": "Above -25,000",
+   "close_time": "2026-12-04T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26NOV-T0",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 0 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of November 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 0,
+   "cap_strike": null,
+   "yes_sub_title": "Above 0",
+   "close_time": "2026-12-04T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26NOV-T10000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 10000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of November 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 10000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 10,000",
+   "close_time": "2026-12-04T13:29:00Z"
+  },
+  {
+   "ticker": "KXPAYROLLS-26NOV-T100000",
+   "rules_primary": "If the increase in total non-farm payroll employment is above 100000 as reported by the Bureau of Labor Statistics Monthly Employment Situation Report for the month of November 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 100000,
+   "cap_strike": null,
+   "yes_sub_title": "Above 100,000",
+   "close_time": "2026-12-04T13:29:00Z"
+  }
+ ]
+}

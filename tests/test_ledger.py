@@ -132,3 +132,135 @@ def test_shadow_enabled_from_reraises_transient_errors():
 
     with pytest.raises(sqlite3.OperationalError):
         shadow_enabled_from(Locked())
+
+
+# ---------- v0.5.0: additive columns and tables, book backfill ----------
+NEW_TRADE_COLS = {"book", "entry_style", "order_id", "limit_price"}
+NEW_DECISION_COLS = {"quote_wait_ms", "n_live_quotes", "starter_action", "starter_reason", "starter_market_id"}
+NEW_TABLES = {"paper_orders", "paper_fills", "releases", "release_markets", "bls_requests"}
+
+
+def _tables(L):
+    return {r[0] for r in L.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def test_new_columns_and_tables_on_a_fresh_ledger(tmp_ledger):
+    assert NEW_TRADE_COLS <= columns(tmp_ledger.db, "trades")
+    assert NEW_DECISION_COLS <= columns(tmp_ledger.db, "decisions")
+    assert NEW_TABLES <= _tables(tmp_ledger)
+    assert {"id", "book", "event_id", "market_id", "side", "style", "limit_price", "take_price", "requested", "filled",
+            "avg_price", "cost", "fee", "status", "note", "created_ts", "expires_ts", "updated_ts", "closed_ts", "trade_id",
+            "signal_strength", "signal_decisive", "synthetic"} <= columns(tmp_ledger.db, "paper_orders")
+    assert {"order_id", "ts", "contracts", "price", "evidence", "ask_seen", "qty_seen"} <= columns(tmp_ledger.db, "paper_fills")
+    assert {"day", "n"} == columns(tmp_ledger.db, "bls_requests")
+
+
+def test_new_columns_and_tables_on_an_old_ledger_and_second_open(old_ledger_path):
+    L = Ledger(old_ledger_path)
+    assert NEW_TRADE_COLS <= columns(L.db, "trades") and NEW_DECISION_COLS <= columns(L.db, "decisions")
+    assert NEW_TABLES <= _tables(L)
+    Ledger(old_ledger_path)                                   # idempotent
+
+
+def test_book_backfill_from_shadow_flag(tmp_path):
+    import sqlite3
+    from conftest import OLD_SCHEMA
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.executescript(OLD_SCHEMA)
+    db.execute("ALTER TABLE trades ADD COLUMN shadow INTEGER DEFAULT 0")
+    for i, shadow in enumerate((0, 1, 0, 1)):
+        db.execute("INSERT INTO trades (event_id, opened_ts, venue, market_id, side, contracts, avg_price, cost, fee, shadow) "
+                   "VALUES (?, 1, 'kalshi', ?, 'yes', 1, .5, .5, 0, ?)", (f"e{i}", f"MK{i}", shadow))
+    db.commit(); db.close()
+    L = Ledger(path)
+    assert L.db.execute("SELECT market_id, shadow, book FROM trades ORDER BY id").fetchall() == [
+        ("MK0", 0, "live"), ("MK1", 1, "shadow"), ("MK2", 0, "live"), ("MK3", 1, "shadow")]
+    L.db.execute("UPDATE trades SET book = 'starter' WHERE market_id = 'MK0'")
+    assert Ledger(path).db.execute("SELECT book FROM trades WHERE market_id = 'MK0'").fetchone() == ("starter",)   # never overwritten
+
+
+def test_trade_defaults_book_from_shadow_and_accepts_starter(tmp_ledger):
+    base = dict(event_id="e", opened_ts=1e12, venue="kalshi", side="yes", contracts=1, avg_price=.5, cost=.5, fee=0, best_ask=.5,
+                synthetic=0)
+    tmp_ledger.trade(market_id="A", market_question="Q", shadow=0, **base)
+    tmp_ledger.trade(market_id="B", market_question="Q", shadow=1, **base)
+    tmp_ledger.trade(market_id="C", market_question="Q", shadow=0, book="starter", **base)
+    assert dict(tmp_ledger.db.execute("SELECT market_id, book FROM trades")) == {"A": "live", "B": "shadow", "C": "starter"}
+    assert tmp_ledger.traded_markets() == {"A"} and tmp_ledger.traded_markets("starter") == {"C"}
+    assert tmp_ledger.traded_markets(shadow=True) == {"B"} and tmp_ledger.traded_markets(shadow=False) == {"A"}
+
+
+def test_starter_trades_never_count_in_spent_today(tmp_ledger):
+    import time as _t
+    tmp_ledger.trade(event_id="e", opened_ts=_t.time(), venue="kalshi", market_id="C", market_question="Q", side="yes",
+                     contracts=10, avg_price=.5, cost=5.0, fee=.1, best_ask=.5, synthetic=0, book="starter")
+    tmp_ledger.trade(event_id="e2", opened_ts=_t.time(), venue="kalshi", market_id="D", market_question="Q", side="yes",
+                     contracts=10, avg_price=.5, cost=7.0, fee=.2, best_ask=.5, synthetic=0, shadow=0)
+    assert tmp_ledger.spent_today() == pytest.approx(7.2)
+
+
+def test_mark_key_is_book_aware_and_bool_compatible():
+    assert mark_key("x", "live") == "x" and mark_key("x", "shadow") == "shadow:x" and mark_key("x", "starter") == "starter:x"
+    assert mark_key("x", True) == "shadow:x" and mark_key("x", False) == "x" and mark_key("x", 1) == "shadow:x"
+
+
+def test_open_order_markets_only_working_nonsynthetic_in_that_book(tmp_ledger):
+    o = dict(venue="kalshi", side="yes", style="post", limit_price=.5, requested=10, created_ts=1.0)
+    tmp_ledger.order_place(book="shadow", market_id="W1", status="working", synthetic=0, **o)
+    tmp_ledger.order_place(book="shadow", market_id="W2", status="filled", synthetic=0, **o)
+    tmp_ledger.order_place(book="shadow", market_id="W3", status="working", synthetic=1, **o)
+    tmp_ledger.order_place(book="starter", market_id="W4", status="working", synthetic=0, **o)
+    assert tmp_ledger.open_order_markets("shadow") == {"W1"} and tmp_ledger.open_order_markets("starter") == {"W4"}
+    assert tmp_ledger.open_order_markets("live") == set()
+    assert tmp_ledger.traded_markets("shadow") == {"W1"}          # a working order counts as a position
+    assert tmp_ledger.traded_markets("live") == set()
+
+
+def test_order_update_get_recent_and_fill_add(tmp_ledger):
+    oid = tmp_ledger.order_place(book="shadow", market_id="M", venue="kalshi", side="yes", style="post", limit_price=.5,
+                                 requested=10, status="working", created_ts=100.0, synthetic=0)
+    assert tmp_ledger.order_get(oid)["filled"] == 0 and [o["id"] for o in tmp_ledger.orders_working()] == [oid]
+    tmp_ledger.order_update(oid, status="post_expired", closed_ts=500.0)
+    assert tmp_ledger.orders_working() == [] and tmp_ledger.order_get(99) is None
+    assert [o["id"] for o in tmp_ledger.orders_recent(10, since_ts=400.0)] == [oid]
+    assert tmp_ledger.orders_recent(10, since_ts=600.0) == []
+    fid = tmp_ledger.fill_add(order_id=oid, ts=1.0, contracts=3, price=.5, evidence="{}", ask_seen=.5, qty_seen=9)
+    assert fid == 1 and tmp_ledger.db.execute("SELECT contracts, qty_seen FROM paper_fills").fetchone() == (3, 9)
+
+
+def test_trade_update_changes_only_the_named_fields(tmp_ledger):
+    tid = tmp_ledger.trade(event_id="e", opened_ts=1.0, venue="kalshi", market_id="M", market_question="Q", side="yes",
+                           contracts=30, avg_price=.54, cost=16.2, fee=.3, best_ask=.55, synthetic=0, book="shadow")
+    tmp_ledger.trade_update(tid, contracts=100, cost=54.0, fee=1.2)
+    assert tmp_ledger.db.execute("SELECT contracts, avg_price, cost, fee, best_ask, book FROM trades WHERE id=?", (tid,)).fetchone() \
+        == (100, .54, 54.0, 1.2, .55, "shadow")
+
+
+def test_bls_request_add_counts_per_day_and_persists(tmp_path):
+    L = Ledger(tmp_path / "l.db")
+    assert L.bls_requests("2026-10-14") == 0
+    assert [L.bls_request_add("2026-10-14") for _ in range(3)] == [1, 2, 3]
+    L.bls_request_add("2026-10-15")
+    assert L.bls_requests("2026-10-14") == 3 and L.bls_requests("2026-10-15") == 1
+    assert Ledger(tmp_path / "l.db").bls_requests("2026-10-14") == 3
+
+
+def test_release_and_market_rows_roundtrip(tmp_ledger):
+    tmp_ledger.release_put(id="cpi-2026-09", kind="cpi", status="armed", note="")
+    tmp_ledger.release_put(id="cpi-2026-09", kind="cpi", status="done", value=0.4)
+    r = tmp_ledger.release_get("cpi-2026-09")
+    assert r["status"] == "done" and r["value"] == 0.4 and tmp_ledger.release_get("nope") is None
+    tmp_ledger.release_market_put(market_id="KXCPI-26SEP-T0.3", series="KXCPI", strike_type="greater", floor_strike=.3)
+    assert tmp_ledger.db.execute("SELECT series, floor_strike FROM release_markets").fetchone() == ("KXCPI", .3)
+
+
+def test_a_v040_style_reader_still_opens_a_v050_ledger(tmp_ledger):
+    """Additive only: the 0.1.1 column set of every old table is still present, so an older binary keeps working."""
+    import sqlite3
+    from conftest import OLD_SCHEMA
+    old = sqlite3.connect(":memory:")
+    old.executescript(OLD_SCHEMA)
+    for table in ("events", "decisions", "trades", "ticks", "marks"):
+        old_cols = {r[1] for r in old.execute(f"PRAGMA table_info({table})")}
+        assert old_cols <= columns(tmp_ledger.db, table), table

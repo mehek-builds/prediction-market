@@ -1,0 +1,138 @@
+{
+ "fetched_ts": 1791577342,
+ "source": "https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=KXFEDDECISION&with_nested_markets=true&status=open&limit=20",
+ "markets": [
+  {
+   "ticker": "KXFEDDECISION-26OCT-C26",
+   "rules_primary": "If the Federal Reserve does a Cut of   25bps on October 28, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Cut >25bps",
+   "close_time": "2026-10-28T17:59:00Z",
+   "custom_strike": {
+    "Cut": ">25"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-26OCT-C25",
+   "rules_primary": "If the Federal Reserve does a Cut of 25bps on October 28, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Cut 25bps",
+   "close_time": "2026-10-28T17:59:00Z",
+   "custom_strike": {
+    "Cut": "25"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-26OCT-H0",
+   "rules_primary": "If the Federal Reserve does a Hike of 0bps on October 28, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Fed maintains rate",
+   "close_time": "2026-10-28T17:59:00Z",
+   "custom_strike": {
+    "Hike": "0"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-26OCT-H25",
+   "rules_primary": "If the Federal Reserve does a Hike of 25bps on October 28, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Hike 25bps",
+   "close_time": "2026-10-28T17:59:00Z",
+   "custom_strike": {
+    "Hike": "25"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-26OCT-H26",
+   "rules_primary": "If the Federal Reserve does a Hike of   25bps on October 28, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Hike >25bps",
+   "close_time": "2026-10-28T17:59:00Z",
+   "custom_strike": {
+    "Hike": ">25"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-26DEC-C26",
+   "rules_primary": "If the Federal Reserve does a Cut of   25bps on December 09, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Cut >25bps",
+   "close_time": "2026-12-09T18:59:00Z",
+   "custom_strike": {
+    "Cut": ">25"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-26DEC-C25",
+   "rules_primary": "If the Federal Reserve does a Cut of 25bps on December 09, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Cut 25bps",
+   "close_time": "2026-12-09T18:59:00Z",
+   "custom_strike": {
+    "Cut": "25"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-26DEC-H0",
+   "rules_primary": "If the Federal Reserve does a Hike of 0bps on December 09, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Fed maintains rate",
+   "close_time": "2026-12-09T18:59:00Z",
+   "custom_strike": {
+    "Hike": "0"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-26DEC-H25",
+   "rules_primary": "If the Federal Reserve does a Hike of 25bps on December 09, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Hike 25bps",
+   "close_time": "2026-12-09T18:59:00Z",
+   "custom_strike": {
+    "Hike": "25"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-26DEC-H26",
+   "rules_primary": "If the Federal Reserve does a Hike of   25bps on December 09, 2026, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Hike >25bps",
+   "close_time": "2026-12-09T18:59:00Z",
+   "custom_strike": {
+    "Hike": ">25"
+   }
+  },
+  {
+   "ticker": "KXFEDDECISION-28JAN-H26",
+   "rules_primary": "If the Federal Reserve does a Hike of >25bps on January 26, 2028, then the market resolves to Yes.",
+   "strike_type": "custom",
+   "floor_strike": null,
+   "cap_strike": null,
+   "yes_sub_title": "Hike >25bps",
+   "close_time": "2028-01-26T18:59:00Z",
+   "custom_strike": {
+    "Hike": ">25"
+   }
+  }
+ ]
+}

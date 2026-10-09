@@ -48,6 +48,12 @@ The ledger is forward and backward compatible across these versions: new release
 rollback does not need a ledger rollback. If a future release ever changes that, it must say so in CHANGELOG.md and
 in this file.
 
+v0.5.0 ledger changes are additive (new columns on `decisions` and `trades`, new tables `paper_orders`, `paper_fills`,
+`releases`, `release_markets`, `bls_requests`): v0.4.0 reads the ledger and ignores them, and working paper orders are
+abandoned on rollback (they are paper). One caveat: v0.4.0 does not know the starter book, whose trades carry
+`shadow = 0`, so a v0.4.0 binary counts them with the real paper book; roll back with the starter book empty or
+ignore its rows (`trades.book = 'starter'`).
+
 To ship the fix: fix forward on a branch, run the tests, tag a new patch version, and only then tell users to move.
 
 ## 3. Roll back the data

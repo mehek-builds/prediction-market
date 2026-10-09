@@ -20,14 +20,14 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #000000; --fg: #D9D4C7; --dim: #8A8578; --rule: #2A2A2A;
-  --amber: #FFB000; --up: #3DDC84; --down: #FF5C5C; --cool: #5B8DEF;
-  --hi-amber: rgba(255,176,0,.10); --hi-cool: rgba(91,141,239,.12);
+  --amber: #FFB000; --up: #3DDC84; --down: #FF5C5C; --cool: #5B8DEF; --starter: #D78BFF;
+  --hi-amber: rgba(255,176,0,.10); --hi-cool: rgba(91,141,239,.12); --hi-starter: rgba(215,139,255,.12);
 }
 :root[data-theme="light"] {
   color-scheme: light;
   --bg: #F2F3EE; --fg: #15191D; --dim: #5B6168; --rule: #BFC9DA;
-  --amber: #8A5A00; --up: #0A6E35; --down: #B3261E; --cool: #2A5BD7;
-  --hi-amber: rgba(138,90,0,.08); --hi-cool: rgba(42,91,215,.08);
+  --amber: #8A5A00; --up: #0A6E35; --down: #B3261E; --cool: #2A5BD7; --starter: #7B2FA0;
+  --hi-amber: rgba(138,90,0,.08); --hi-cool: rgba(42,91,215,.08); --hi-starter: rgba(123,47,160,.08);
 }
 :root { --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace; --row: 22px; }
 * { box-sizing: border-box; border-radius: 0; }
@@ -39,6 +39,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--amber); outline
 h2 { margin: 0; font-size: 10px; font-weight: 700; letter-spacing: .08em; color: var(--amber); }
 dl, dd { margin: 0; }
 [hidden] { display: none !important; }
+.starter { color: var(--starter); }
 .pos { color: var(--up); } .neg { color: var(--down); } .dim { color: var(--dim); } .cool { color: var(--cool); } .amber { color: var(--amber); }
 .r { text-align: right; }
 
@@ -57,6 +58,8 @@ kbd { font: 700 10px/1.3 var(--mono); background: var(--fg); color: var(--bg); p
 .key[data-cmd="shadow:toggle"][aria-pressed="true"] { border-bottom-color: var(--cool); }
 .key[data-cmd^="book:shadow"][data-active="true"] span { color: var(--cool); }
 .key[data-cmd^="book:shadow"][data-active="true"] { border-bottom-color: var(--cool); }
+.key[data-cmd^="book:starter"][data-active="true"] span { color: var(--starter); }
+.key[data-cmd^="book:starter"][data-active="true"] { border-bottom-color: var(--starter); }
 
 #app { max-width: 1600px; margin: 0 auto; padding: 0 8px 24px; }
 
@@ -126,8 +129,11 @@ td.r, th.r { text-align: right; }
 tr.totals td { border-top: 3px double var(--fg); border-bottom: 0; font-weight: 700; }
 tr[data-active="true"] td:first-child { box-shadow: inset 2px 0 0 var(--amber); }
 tr[data-active="true"].shadow-row td:first-child { box-shadow: inset 2px 0 0 var(--cool); }
+tr[data-active="true"].starter-row td:first-child { box-shadow: inset 2px 0 0 var(--starter); }
 tr.fill { background: var(--hi-amber); }
 tr.shdw { background: var(--hi-cool); }
+tr.strt { background: var(--hi-starter); }
+tr.dim-row td { color: var(--dim); font-size: 10px; }
 tr.test td { color: var(--dim); }
 td.clip { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .scroll { overflow-x: auto; }
@@ -143,6 +149,7 @@ td.clip { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .chip { display: inline-block; font-size: 10px; letter-spacing: .06em; text-transform: uppercase; padding: 0 5px; border: 1px solid var(--rule); color: var(--dim); margin-right: 4px; }
 .chip.fill { color: var(--amber); border-color: var(--amber); background: none; }
 .chip.shdw { color: var(--cool); border-color: var(--cool); background: none; }
+.chip.strt { color: var(--starter); border-color: var(--starter); background: none; }
 .sub { display: block; font-size: 10px; color: var(--dim); }
 .src { color: var(--dim); text-transform: uppercase; font-size: 10px; letter-spacing: .06em; }
 .hl a { text-decoration: none; } .hl a:hover { text-decoration: underline; }
@@ -153,7 +160,7 @@ td.clip { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 4px 8px 6px; font-size: 10px; letter-spacing: .06em; }
 .legend span.item { display: inline-flex; gap: 6px; align-items: center; }
 .sw { display: inline-block; width: 12px; height: 4px; }
-.sw.live { background: var(--amber); } .sw.shadow { background: var(--cool); }
+.sw.live { background: var(--amber); } .sw.shadow { background: var(--cool); } .sw.starter { background: var(--starter); }
 .sw.test { background: none; border-top: 1px dashed var(--dim); height: 0; }
 .bar svg { width: 100px; height: 8px; display: block; }
 
@@ -161,11 +168,15 @@ td.clip { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 0; }
 .card { border: 1px solid var(--rule); margin: 0 -1px -1px 0; padding: 8px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .card.shadow { border-style: dashed; border-color: var(--cool); }
+.card.starter { border-style: dashed; border-color: var(--starter); }
 .card.test { border-style: dashed; color: var(--dim); }
 .card h3 { margin: 0; font-size: 12px; font-weight: 700; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .card .row { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
 .card .tag { margin-left: auto; padding: 0 5px; border: 1px solid var(--amber); color: var(--amber); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
 .card .tag.shadow { color: var(--cool); border-color: var(--cool); }
+.card .tag.starter { color: var(--starter); border-color: var(--starter); }
+.card .tag.post { color: var(--dim); border-color: var(--dim); }
+.card .tag.post + .tag { margin-left: 4px; }
 .card .tag.test { color: var(--dim); border-color: var(--dim); border-style: dashed; }
 .card .big { font-size: 16px; font-weight: 700; }
 .card .minis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; border-top: 1px solid var(--rule); padding-top: 6px; }
@@ -224,6 +235,7 @@ td.clip { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
   <button class="key" type="button" data-cmd="book:live" title="Live paper trades under the real rule"><kbd>2</kbd><span>LIVE</span></button>
   <button class="key" type="button" data-cmd="book:shadow"><kbd>3</kbd><span>SHADOW</span></button>
   <button class="key" type="button" data-cmd="book:test"><kbd>4</kbd><span>TEST</span></button>
+  <button class="key" type="button" data-cmd="book:starter" title="Small paper book on a stricter-than-shadow rule"><kbd>5</kbd><span>STARTER</span></button>
   <span class="sep"></span>
   <button class="key" type="button" data-cmd="view:table"><kbd>B</kbd><span>TABLE</span></button>
   <button class="key" type="button" data-cmd="view:cards"><kbd>C</kbd><span>CARDS</span></button>
@@ -263,6 +275,16 @@ td.clip { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
         <th scope="col" class="r xs-hide">WIN</th><th scope="col" class="r xs-hide">MED MS</th>
       </tr></thead>
       <tbody id="book-rows"></tbody>
+    </table>
+  </section>
+  <section id="working" class="panel" aria-label="Working orders" hidden>
+    <div class="hdr"><h2>WORKING ORDERS</h2><span class="right" id="working-note"></span></div>
+    <table class="ledger">
+      <thead><tr>
+        <th scope="col">BOOK</th><th scope="col">MARKET</th><th scope="col">SIDE</th><th scope="col" class="r">LIMIT</th>
+        <th scope="col" class="r">FILLED/REQ</th><th scope="col" class="r">AGE</th><th scope="col" class="r">EXPIRES</th>
+      </tr></thead>
+      <tbody id="working-rows"></tbody>
     </table>
   </section>
   <section id="control" class="panel" aria-label="Trading mode" hidden>
@@ -312,6 +334,9 @@ const REASONS = {
   too_expensive: "Too expensive to trade", no_exit_liquidity: "No buyers to sell to",
   longshot: "Long shot under 3c", real_signalled: "Real rule signalled",
   no_book: "Order book unavailable", unknown_market: "Market not found", jev_error: "Jev call failed",
+  post_working: "Resting order placed", post_expired: "Resting order expired", post_queue_full: "Too many working orders",
+  sports_market: "Sports market", release_yes: "Bought YES on data release", release_no: "Bought NO on data release",
+  release_margin: "Too close to the strike", rules_mismatch: "Market rules not recognised",
 };
 const SVGNS = "http://www.w3.org/2000/svg";
 const BUCKET_ORDER = ["<0.60", "0.60-0.70", "0.70-0.85", "0.85+", "unknown"];
@@ -322,7 +347,7 @@ const COLS = [
   ["P&L $", "pnl", "r"], ["P&L %", "pnl_pct", "r"], ["SIGNAL", "sig", "r"], ["BOOK", "book", ""],
 ];
 const KEYS = [
-  ["1 2 3 4", "Show ALL / LIVE / SHADOW / TEST trades"], ["B  C", "Blotter as table / as cards"],
+  ["1 2 3 4 5", "Show ALL / LIVE / SHADOW / TEST / STARTER trades"], ["B  C", "Blotter as table / as cards"],
   ["S", "Cycle sort: newest, best P&L, worst P&L"], ["H", "Turn shadow mode on or off (paper experiment only)"],
   ["T", "Toggle dark TERMINAL / light LEDGER theme"], ["R", "Refresh now"], ["?", "Show or hide this list"],
   ["", "No key arms real money: TRADING MODE panel, typed confirmation, then the ARM button"],
@@ -331,7 +356,7 @@ const state = {
   data: null, decisions: [], status: null, settings: null, error: false, toggling: false, flash: null,
   filter: "live", view: "table", sort: { key: "time", dir: "desc" }, now: Date.now() / 1000,
   seenRows: null, helpOpen: false, theme: "dark",
-  control: null, arming: false, armError: null, busy: false,
+  control: null, arming: false, armError: null, busy: false, working: null,
 };
 try { state.view = window.matchMedia("(max-width: 720px)").matches ? "cards" : "table"; } catch (e) {}
 
@@ -408,7 +433,7 @@ function pctile(sorted, q) {
   if (!sorted.length) return null;
   return sorted[Math.max(0, Math.ceil(q * sorted.length) - 1)];
 }
-const bookOf = t => (t.synthetic ? "test" : t.shadow ? "shadow" : "live");
+const bookOf = t => (t.synthetic ? "test" : (t.book || (t.shadow ? "shadow" : "live")));
 function medianMs(trades) {
   const ms = trades.map(t => t.decision.total_ms).filter(v => v != null).sort((a, b) => a - b);
   return pctile(ms, 0.5);
@@ -416,7 +441,7 @@ function medianMs(trades) {
 
 const MAX_CURVE_X = 320;
 function bookCurves(trades, now) {
-  const out = { live: [], shadow: [], test: [] };
+  const out = { live: [], shadow: [], starter: [], test: [] };
   const floor = now - 86400;
   for (const b of Object.keys(out)) {
     const ts = trades.filter(t => bookOf(t) === b && t.path && t.path.length);
@@ -496,15 +521,26 @@ function mini(label, value, sub, cls) {
   return d;
 }
 
+function entryTitle(t) {
+  if (t.entry_style === "post") {
+    return "post fill at limit " + cents(t.limit_price != null ? t.limit_price : t.entry_price) +
+           " (take would have been " + cents(t.best_ask_at_entry) + ")";
+  }
+  return "take";
+}
+
 function card(t) {
   const yes = t.side === "yes";
   const moveVar = t.move_cents == null ? "var(--dim)" : t.move_cents > 0 ? "var(--up)" : t.move_cents < 0 ? "var(--down)" : "var(--fg)";
-  const c = el("article", "card" + (t.shadow ? " shadow" : "") + (t.synthetic ? " test" : ""));
+  const book = bookOf(t);
+  const c = el("article", "card" + (book === "shadow" ? " shadow" : book === "starter" ? " starter" : "") + (t.synthetic ? " test" : ""));
   const top = el("div", "row lbl");
   top.append(el("span", null, t.venue), el("span", null, "·"),
              ageEl("num", t.opened_ts, new Date(t.opened_ts * 1000).toLocaleString()));
   if (t.shadow && t.signal_strength != null) top.append(el("span", null, "signal " + Math.round(t.signal_strength * 100) + "%"));
+  if (t.entry_style === "post") top.append(el("span", "tag post", "Post", { title: entryTitle(t) }));
   if (t.shadow) top.append(el("span", "tag shadow", "Shadow", { title: "What a looser rule would have traded. Not a real paper trade." }));
+  else if (book === "starter") top.append(el("span", "tag starter", "Starter", { title: "Paper starter book: strength >= 0.90, no decisive requirement, $20 a trade" }));
   else if (t.synthetic) top.append(el("span", "tag test", "Test", { title: "Made-up headline used to test the pipeline. Not counted as a live result." }));
   else top.append(el("span", "tag", "Live", { title: "Live paper trade under the real rule" }));
   const h3 = el("h3", null, t.question, { title: t.question });
@@ -533,8 +569,9 @@ function card(t) {
 // ---- blotter ----
 function visibleTrades() {
   let t = state.data ? state.data.trades.slice() : [];
-  if (state.filter === "live") t = t.filter(x => !x.synthetic && !x.shadow);
-  if (state.filter === "shadow") t = t.filter(x => x.shadow);
+  if (state.filter === "live") t = t.filter(x => bookOf(x) === "live");
+  if (state.filter === "shadow") t = t.filter(x => bookOf(x) === "shadow");
+  if (state.filter === "starter") t = t.filter(x => bookOf(x) === "starter");
   if (state.filter === "test") t = t.filter(x => x.synthetic);
   return t;
 }
@@ -574,7 +611,7 @@ function buildBlotterHead() {
 }
 function trRow(t, isNew) {
   const book = bookOf(t);
-  const tr = el("tr", (book === "shadow" ? "shdw" : book === "test" ? "test" : "fill") + (isNew ? " new" : ""));
+  const tr = el("tr", (book === "shadow" ? "shdw" : book === "starter" ? "strt" : book === "test" ? "test" : "fill") + (isNew ? " new" : ""));
   const when = new Date(t.opened_ts * 1000).toLocaleString();
   tr.append(
     td(etTime(t.opened_ts), "", { title: when + " (" + ago(t.opened_ts, state.now) + ")" }),
@@ -582,14 +619,15 @@ function trRow(t, isNew) {
     td(t.question, "clip", { title: t.question + "\n" + t.trigger.headline }),
     td(t.side.toUpperCase(), t.side === "yes" ? "pos" : "neg"),
     td(Number(t.contracts).toLocaleString("en-US", { maximumFractionDigits: 2 }), "r"),
-    td(cents(t.entry_price), "r"),
+    td(cents(t.entry_price), "r", { title: entryTitle(t) }),
     td(cents(t.now_price), "r"),
     td(moveStr(t.move_cents), "r " + signClass(t.move_cents)),
     td(sMoney(t.pnl), "r " + signClass(t.pnl)),
     td(sPct(t.pnl_pct), "r " + signClass(t.pnl)),
     td(t.signal_strength == null ? "--" : Math.round(t.signal_strength * 100) + "/" + (t.signal_decisive == null ? "--" : Math.round(t.signal_decisive * 100)),
        "r", { title: "signal strength / P(decisive)" }),
-    td(book === "shadow" ? "SHDW" : book.toUpperCase(), book === "shadow" ? "cool" : ""));
+    td(book === "shadow" ? "SHDW" : book === "starter" ? "STRT" : book.toUpperCase(),
+       book === "shadow" ? "cool" : book === "starter" ? "starter" : ""));
   return tr;
 }
 function renderBlotter() {
@@ -627,6 +665,7 @@ function emptyText() {
     const s = state.data ? state.data.summary : null;
     const hint = [];
     if (s && s.shadow_trades > 0) hint.push(s.shadow_trades + " shadow trades: press 3 to view.");
+    if (s && s.starter_trades > 0) hint.push(s.starter_trades + " starter trades: press 5 to view.");
     if (s && s.test_trades > 0) hint.push(s.test_trades + " test trades: press 4 to view.");
     return "No live paper trades yet. A row appears the moment the fast lane takes one." + (hint.length ? " " + hint.join(" ") : "");
   }
@@ -634,6 +673,11 @@ function emptyText() {
     return state.settings && state.settings.enabled === false
       ? "Shadow mode is off (key H to turn it on). Existing shadow trades stay here and keep being marked."
       : "No shadow trades yet. A row appears here when the looser shadow rule would have traded and the real rule passed.";
+  }
+  if (state.filter === "starter") {
+    return state.settings && state.settings.starter_enabled === false
+      ? "The starter book is off (STARTER_ENABLED=false in .env)."
+      : "No starter trades yet. A row appears when the starter rule would have traded and the real rule passed.";
   }
   if (state.filter === "test") return "No test trades. Inject a headline with python3 -m fastlane.run --inject to see one.";
   return "No paper trades yet. Start the fast lane with python3 -m fastlane.run and rows appear as trades fill.";
@@ -646,13 +690,14 @@ function winText(a) {
 }
 function bookRow(name, a, ms, filterKey, opts) {
   opts = opts || {};
-  const tr = el("tr", (opts.totals ? "totals " : "") + (filterKey === "shadow" ? "shadow-row" : ""));
+  const tr = el("tr", (opts.totals ? "totals " : "") + (filterKey === "shadow" ? "shadow-row" : filterKey === "starter" ? "starter-row" : ""));
   if (filterKey && state.filter === filterKey) tr.setAttribute("data-active", "true");
   const first = el("td");
   if (filterKey) {
-    first.append(el("button", "book-btn " + (filterKey === "shadow" ? "cool" : filterKey === "live" ? "amber" : "dim"), name,
+    first.append(el("button", "book-btn " + (filterKey === "shadow" ? "cool" : filterKey === "starter" ? "starter" : filterKey === "live" ? "amber" : "dim"), name,
                     { type: "button", "data-book": filterKey, title: filterKey === "live" ? "Live paper trades under the real rule" : "Show this book in the blotter" }));
     if (filterKey === "shadow" && state.settings && state.settings.enabled === false) first.append(el("span", "dim", " (OFF)"));
+    if (filterKey === "starter" && state.settings && state.settings.starter_enabled === false) first.append(el("span", "dim", " (OFF)"));
   } else {
     first.textContent = name;
   }
@@ -670,14 +715,15 @@ function renderBooks() {
   const all = state.data ? state.data.trades : [];
   const by = b => all.filter(t => bookOf(t) === b);
   const empty = { trades: 0, invested: 0, value: 0, pnl: 0, winners: 0, losers: 0 };
-  const bk = s ? s.books : { live: empty, shadow: empty, test: empty };
+  const bk = s ? Object.assign({ starter: empty }, s.books) : { live: empty, shadow: empty, starter: empty, test: empty };
   const real = s ? { trades: s.live_trades + s.test_trades, invested: s.invested, value: s.value, pnl: s.pnl,
                      winners: s.winners, losers: s.losers } : empty;
   body.replaceChildren(
     bookRow("LIVE", bk.live, medianMs(by("live")), "live"),
     bookRow("SHADOW", bk.shadow, medianMs(by("shadow")), "shadow"),
+    bookRow("STARTER", bk.starter, medianMs(by("starter")), "starter"),
     bookRow("TEST", bk.test, medianMs(by("test")), "test"),
-    bookRow("REAL (LIVE+TEST)", real, medianMs(all.filter(t => !t.shadow)), null, { totals: true }));
+    bookRow("REAL (LIVE+TEST)", real, medianMs(all.filter(t => bookOf(t) === "live" || bookOf(t) === "test")), null, { totals: true }));
   document.getElementById("books-note").textContent = s ? "AS OF " + etTime(s.as_of) + " ET" : "LOADING";
 }
 
@@ -685,7 +731,7 @@ function renderBooks() {
 function renderPnl() {
   const svg = document.getElementById("pnl-svg"), legend = document.getElementById("pnl-legend");
   const now = state.now;
-  const curves = state.data ? bookCurves(state.data.trades, now) : { live: [], shadow: [], test: [] };
+  const curves = state.data ? bookCurves(state.data.trades, now) : { live: [], shadow: [], starter: [], test: [] };
   const drawn = Object.keys(curves).filter(b => curves[b].length >= 2);
   document.getElementById("pnl-note").textContent = "MARK-TO-BID · ET";
   const kids = [];
@@ -706,7 +752,7 @@ function renderPnl() {
   const zy = Y(0).toFixed(1);
   kids.push(svgEl("line", { x1: "0", x2: "320", y1: zy, y2: zy, stroke: "var(--rule)", "stroke-dasharray": "3 3",
                             "stroke-width": "1", "vector-effect": "non-scaling-stroke" }));
-  const style = { live: ["var(--amber)", "1.5", null], shadow: ["var(--cool)", "1.5", null], test: ["var(--dim)", "1", "4 3"] };
+  const style = { live: ["var(--amber)", "1.5", null], shadow: ["var(--cool)", "1.5", null], starter: ["var(--starter)", "1.5", null], test: ["var(--dim)", "1", "4 3"] };
   for (const b of drawn) {
     const pts = curves[b].filter(p => p[0] >= x0);
     const coords = [];
@@ -731,7 +777,7 @@ function renderPnl() {
 // ---- latency ----
 function renderLatency() {
   const ds = state.decisions;
-  const stages = [["MATCH", "shortlist_ms"], ["JEV", "jev_ms"], ["BOOK", "book_ms"], ["TOTAL", "total_ms"]];
+  const stages = [["MATCH", "shortlist_ms"], ["JEV", "jev_ms"], ["QUOTES", "quote_wait_ms"], ["BOOK", "book_ms"], ["TOTAL", "total_ms"]];
   const stats = stages.map(([name, k]) => {
     const vals = ds.map(d => d[k]).filter(v => v != null).sort((a, b) => a - b);
     const newest = ds.find(d => d[k] != null);
@@ -787,7 +833,8 @@ function renderBuckets() {
 function newsRow(d, isNew) {
   const fill = d.reason === "signal_yes" || d.reason === "signal_no";
   const shadowTraded = d.shadow_traded === true;
-  const tr = el("tr", (fill ? "fill" : shadowTraded ? "shdw" : "") + (isNew ? " new" : ""));
+  const starterTraded = d.starter_traded === true;
+  const tr = el("tr", (fill ? "fill" : shadowTraded ? "shdw" : starterTraded ? "strt" : "") + (isNew ? " new" : ""));
   const when = td(null, "");
   when.append(ageEl(null, d.decided_ts), el("span", "sub", d.total_ms != null ? Math.round(d.total_ms) + "ms" : "--"));
   when.title = etTime(d.decided_ts) + " ET";
@@ -812,6 +859,11 @@ function newsRow(d, isNew) {
     verdict.append(el("span", "chip shdw", "SHDW " + (d.shadow_action === "BUY_YES" ? "YES" : "NO"), {
       title: "Shadow book only. Not a real paper trade." +
              (d.shadow_market_id && d.shadow_market_id !== d.market_id ? " Market: " + d.shadow_market_id : "") }));
+  }
+  if (starterTraded) {
+    verdict.append(el("span", "chip strt", "STRT " + (d.starter_action === "BUY_YES" ? "YES" : "NO"), {
+      title: "Starter book only. Not a real paper trade." +
+             (d.starter_market_id && d.starter_market_id !== d.market_id ? " Market: " + d.starter_market_id : "") }));
   }
   const mv = d.move_cents_our_way;
   const moved = td(mv == null ? "--" : moveStr(mv) + (d.move_horizon_s ? " / " + span(d.move_horizon_s) : ""), signClass(mv),
@@ -1130,9 +1182,47 @@ function renderNotice() {
   if (state.flash) notice.append(el("div", "panel note " + state.flash.cls, state.flash.text));
 }
 
+function renderWorking() {
+  const w = state.working || { working: [], recent: [] };
+  const panel = document.getElementById("working");
+  panel.hidden = !(w.working.length || w.recent.length);
+  document.getElementById("working-note").textContent = w.working.length + " WORKING · " + w.recent.length + " CLOSED 24H";
+  const rows = [];
+  for (const o of w.working) {
+    const tr = el("tr");
+    const exp = el("span", "num", "", { "data-ts": String(o.expires_ts), "data-future": "1" });
+    exp.textContent = "in " + span(Math.max(0, o.expires_ts - state.now));
+    const age = ageEl(null, o.created_ts);
+    const a = td(null, "r"), e = td(null, "r");
+    a.append(age); e.append(exp);
+    tr.append(td(String(o.book).toUpperCase(), o.book === "shadow" ? "cool" : o.book === "starter" ? "starter" : ""),
+              td(o.question || o.market_id, "clip", { title: (o.question || o.market_id) + "\n" + (o.headline || "") }),
+              td(String(o.side).toUpperCase(), o.side === "yes" ? "pos" : "neg"),
+              td(cents(o.limit_price), "r", { title: "take price was " + cents(o.take_price) }),
+              td(Number(o.filled).toLocaleString("en-US", { maximumFractionDigits: 2 }) + "/" +
+                 Number(o.requested).toLocaleString("en-US", { maximumFractionDigits: 2 }), "r"),
+              a, e);
+    rows.push(tr);
+  }
+  for (const o of w.recent) {
+    const tr = el("tr", "dim-row");
+    const a = td(null, "r"), e = td(String(o.status).replace(/_/g, " "), "r");
+    a.append(ageEl(null, o.closed_ts != null ? o.closed_ts : o.created_ts));
+    tr.append(td(String(o.book).toUpperCase()),
+              td(o.question || o.market_id, "clip", { title: o.question || o.market_id }),
+              td(String(o.side).toUpperCase()),
+              td(cents(o.limit_price), "r"),
+              td(Number(o.filled).toLocaleString("en-US", { maximumFractionDigits: 2 }) + "/" +
+                 Number(o.requested).toLocaleString("en-US", { maximumFractionDigits: 2 }), "r"),
+              a, e);
+    rows.push(tr);
+  }
+  document.getElementById("working-rows").replaceChildren(...rows);
+}
 function render() {
   renderNotice();
   renderBooks();
+  renderWorking();
   renderBlotter();
   renderPnl();
   renderLatency();
@@ -1202,7 +1292,7 @@ async function toggleShadow() {
     let j = null;
     try { j = await res.json(); } catch (e) {}
     if (res.ok && j) {
-      state.settings = { enabled: j.shadow_enabled, source: j.source };
+      state.settings = Object.assign({}, state.settings, { enabled: j.shadow_enabled, source: j.source });
       showFlash("cool", j.shadow_enabled
         ? "SHADOW ON · saved to ledger · engine picks it up within 2s"
         : "SHADOW OFF · saved to ledger · existing shadow trades stay and keep being marked", 4000);
@@ -1227,7 +1317,7 @@ function runCmd(cmd) {
   if (cmd === "refresh") { load(); return; }
   if (cmd === "help") { state.helpOpen = !state.helpOpen; document.getElementById("help").hidden = !state.helpOpen; renderCaps(); }
 }
-const KEYMAP = { "1": "book:all", "2": "book:live", "3": "book:shadow", "4": "book:test", b: "view:table", c: "view:cards",
+const KEYMAP = { "1": "book:all", "2": "book:live", "3": "book:shadow", "4": "book:test", "5": "book:starter", b: "view:table", c: "view:cards",
                  s: "sort:cycle", h: "shadow:toggle", t: "theme:toggle", r: "refresh", "?": "help" };
 document.addEventListener("keydown", e => {
   if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
@@ -1266,7 +1356,10 @@ arrowNav(document.getElementById("view-seg"));
 // ---- loading ----
 function tickClock() {
   state.now = Date.now() / 1000;
-  document.querySelectorAll("[data-ts]").forEach(n => { n.textContent = ago(Number(n.getAttribute("data-ts")), state.now); });
+  document.querySelectorAll("[data-ts]").forEach(n => {
+    const ts = Number(n.getAttribute("data-ts"));
+    n.textContent = n.getAttribute("data-future") ? "in " + span(Math.max(0, ts - state.now)) : ago(ts, state.now);
+  });
   renderStatus();
 }
 async function getJson(path) {
@@ -1275,17 +1368,22 @@ async function getJson(path) {
   return r.json();
 }
 async function load() {
-  const [tr, de, stt, set, ctl] = await Promise.all([
+  const [tr, de, stt, set, ctl, wk] = await Promise.all([
     getJson("/trades").then(v => ({ v }), () => null),
     getJson("/decisions?limit=100").then(v => ({ v }), () => null),
     getJson("/status").then(v => ({ v }), () => null),
     getJson("/settings").then(v => ({ v }), () => null),
     getJson("/control/state").then(v => ({ v }), () => null),
+    getJson("/working").then(v => ({ v }), () => null),
   ]);
   if (tr) { state.data = tr.v; state.error = false; } else { state.error = true; }
   if (de) state.decisions = de.v.decisions || [];
   if (stt) state.status = stt.v;
-  if (set && !state.toggling) state.settings = { enabled: !!set.v.shadow_enabled, source: set.v.source };
+  if (set && !state.toggling) {
+    state.settings = { enabled: !!set.v.shadow_enabled, source: set.v.source, starter_enabled: set.v.starter_enabled,
+                       entry_styles: set.v.entry_styles };
+  }
+  if (wk) state.working = wk.v;
   state.control = ctl ? ctl.v : null;   // a failed fetch clears it: renderControl shows "unavailable"
   state.now = Date.now() / 1000;
   renderKeepFocus();

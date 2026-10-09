@@ -1,0 +1,247 @@
+{
+ "version": 1,
+ "sources": {
+  "cpi": "https://www.bls.gov/schedule/news_release/cpi.htm",
+  "jobs": "https://www.bls.gov/schedule/news_release/empsit.htm",
+  "fomc": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+ },
+ "notes": {
+  "fomc": "Meeting dates (decision day, 2:00 PM ET statement) copied from the federalreserve.gov FOMC calendar page; the 2027 dates are marked tentative there. prior_range is filled only for the next meeting (from the 2026-09-16 statement: 3-3/4 to 4 percent); for later meetings it depends on the earlier decisions, so KXFEDDECISION stays skipped until the owner adds it after each meeting.",
+  "bls": "CPI and Employment Situation dates copied from bls.gov/schedule/news_release/cpi.htm and empsit.htm, fetched 2026-10-10. Release time 08:30 ET; period is the reference month. No September 2026 CPI entry: bls.gov lists no date for it yet. Never guess a date; add new rows only from the BLS schedule pages.",
+  "entry": "Entry: {kind: cpi|jobs|fomc, date: YYYY-MM-DD (ET), time_et: HH:MM, period: YYYY-MM (the reference month; fomc: the meeting month), prior_range: [lo, hi] (fomc only, percent, from the previous statement)}. The engine refuses to arm a release without an entry."
+ },
+ "events": [
+  {
+   "kind": "fomc",
+   "date": "2026-10-28",
+   "time_et": "14:00",
+   "period": "2026-10",
+   "prior_range": [
+    3.75,
+    4.0
+   ]
+  },
+  {
+   "kind": "jobs",
+   "date": "2026-11-06",
+   "time_et": "08:30",
+   "period": "2026-10"
+  },
+  {
+   "kind": "cpi",
+   "date": "2026-11-10",
+   "time_et": "08:30",
+   "period": "2026-10"
+  },
+  {
+   "kind": "jobs",
+   "date": "2026-12-04",
+   "time_et": "08:30",
+   "period": "2026-11"
+  },
+  {
+   "kind": "fomc",
+   "date": "2026-12-09",
+   "time_et": "14:00",
+   "period": "2026-12"
+  },
+  {
+   "kind": "cpi",
+   "date": "2026-12-10",
+   "time_et": "08:30",
+   "period": "2026-11"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-01-08",
+   "time_et": "08:30",
+   "period": "2026-12"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-01-13",
+   "time_et": "08:30",
+   "period": "2026-12"
+  },
+  {
+   "kind": "fomc",
+   "date": "2027-01-27",
+   "time_et": "14:00",
+   "period": "2027-01"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-02-05",
+   "time_et": "08:30",
+   "period": "2027-01"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-02-11",
+   "time_et": "08:30",
+   "period": "2027-01"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-03-05",
+   "time_et": "08:30",
+   "period": "2027-02"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-03-10",
+   "time_et": "08:30",
+   "period": "2027-02"
+  },
+  {
+   "kind": "fomc",
+   "date": "2027-03-17",
+   "time_et": "14:00",
+   "period": "2027-03"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-04-02",
+   "time_et": "08:30",
+   "period": "2027-03"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-04-13",
+   "time_et": "08:30",
+   "period": "2027-03"
+  },
+  {
+   "kind": "fomc",
+   "date": "2027-04-28",
+   "time_et": "14:00",
+   "period": "2027-04"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-05-07",
+   "time_et": "08:30",
+   "period": "2027-04"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-05-12",
+   "time_et": "08:30",
+   "period": "2027-04"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-06-04",
+   "time_et": "08:30",
+   "period": "2027-05"
+  },
+  {
+   "kind": "fomc",
+   "date": "2027-06-09",
+   "time_et": "14:00",
+   "period": "2027-06"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-06-10",
+   "time_et": "08:30",
+   "period": "2027-05"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-07-02",
+   "time_et": "08:30",
+   "period": "2027-06"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-07-14",
+   "time_et": "08:30",
+   "period": "2027-06"
+  },
+  {
+   "kind": "fomc",
+   "date": "2027-07-28",
+   "time_et": "14:00",
+   "period": "2027-07"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-08-06",
+   "time_et": "08:30",
+   "period": "2027-07"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-08-11",
+   "time_et": "08:30",
+   "period": "2027-07"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-09-03",
+   "time_et": "08:30",
+   "period": "2027-08"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-09-14",
+   "time_et": "08:30",
+   "period": "2027-08"
+  },
+  {
+   "kind": "fomc",
+   "date": "2027-09-15",
+   "time_et": "14:00",
+   "period": "2027-09"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-10-08",
+   "time_et": "08:30",
+   "period": "2027-09"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-10-14",
+   "time_et": "08:30",
+   "period": "2027-09"
+  },
+  {
+   "kind": "fomc",
+   "date": "2027-10-27",
+   "time_et": "14:00",
+   "period": "2027-10"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-11-05",
+   "time_et": "08:30",
+   "period": "2027-10"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-11-10",
+   "time_et": "08:30",
+   "period": "2027-10"
+  },
+  {
+   "kind": "jobs",
+   "date": "2027-12-03",
+   "time_et": "08:30",
+   "period": "2027-11"
+  },
+  {
+   "kind": "fomc",
+   "date": "2027-12-08",
+   "time_et": "14:00",
+   "period": "2027-12"
+  },
+  {
+   "kind": "cpi",
+   "date": "2027-12-10",
+   "time_et": "08:30",
+   "period": "2027-11"
+  }
+ ]
+}

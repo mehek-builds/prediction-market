@@ -1,0 +1,123 @@
+{
+ "fetched_ts": 1791577342,
+ "source": "https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=KXFED&with_nested_markets=true&status=open&limit=20",
+ "markets": [
+  {
+   "ticker": "KXFED-26OCT-T2.75",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 2.75% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 2.75,
+   "cap_strike": null,
+   "yes_sub_title": "Above 2.75%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T3.00",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 3.00% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 3,
+   "cap_strike": null,
+   "yes_sub_title": "Above 3.00%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T3.25",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 3.25% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 3.25,
+   "cap_strike": null,
+   "yes_sub_title": "Above 3.25%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T3.50",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 3.50% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 3.5,
+   "cap_strike": null,
+   "yes_sub_title": "Above 3.50%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T3.75",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 3.75% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 3.75,
+   "cap_strike": null,
+   "yes_sub_title": "Above 3.75%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T4.00",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 4.00% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.00%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T4.25",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 4.25% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.25,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.25%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T4.50",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 4.50% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.5,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.50%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T4.75",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 4.75% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.75,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.75%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T5.00",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 5.00% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 5,
+   "cap_strike": null,
+   "yes_sub_title": "Above 5.00%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26OCT-T5.25",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 5.25% following the Federal Reserve's Oct 28, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 5.25,
+   "cap_strike": null,
+   "yes_sub_title": "Above 5.25%",
+   "close_time": "2026-10-28T17:55:00Z"
+  },
+  {
+   "ticker": "KXFED-26DEC-T2.75",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 2.75% following the Federal Reserve's Dec 9, 2026 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 2.75,
+   "cap_strike": null,
+   "yes_sub_title": "Above 2.75%",
+   "close_time": "2026-12-09T18:55:00Z"
+  },
+  {
+   "ticker": "KXFED-27JAN-T0.00",
+   "rules_primary": "If the upper bound of the target federal funds rate published on the Federal Reserve's official website is greater than 0.00% following the Federal Reserve's Jan 27, 2027 meeting, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 0,
+   "cap_strike": null,
+   "yes_sub_title": "Above 0.00%",
+   "close_time": "2027-01-27T18:55:00Z"
+  }
+ ]
+}

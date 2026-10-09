@@ -355,11 +355,16 @@ def test_health_keeps_ok_and_ledger_keys(seeded):
 CTRL = {"X-Fastlane-Control": "1"}
 
 
+def _core(settings: dict) -> dict:
+    """The shadow part of /settings; 0.5.0 added starter_enabled and entry_styles next to it."""
+    return {k: settings[k] for k in ("shadow_enabled", "source")}
+
+
 def test_settings_get_env_fallback(seeded, monkeypatch):
     c, _, _ = seeded
-    assert c.get("/settings").json() == {"shadow_enabled": True, "source": "env"}
+    assert _core(c.get("/settings").json()) == {"shadow_enabled": True, "source": "env"}
     monkeypatch.setenv("SHADOW_ENABLED", "false")
-    assert c.get("/settings").json() == {"shadow_enabled": False, "source": "env"}
+    assert _core(c.get("/settings").json()) == {"shadow_enabled": False, "source": "env"}
 
 
 def test_shadow_toggle_persists_and_wins_over_env(seeded, monkeypatch):
@@ -367,7 +372,7 @@ def test_shadow_toggle_persists_and_wins_over_env(seeded, monkeypatch):
     monkeypatch.setenv("SHADOW_ENABLED", "false")
     r = c.post("/settings/shadow", json={"enabled": True}, headers=CTRL)
     assert r.status_code == 200 and r.json() == {"shadow_enabled": True, "source": "ledger"}
-    assert c.get("/settings").json() == {"shadow_enabled": True, "source": "ledger"}
+    assert _core(c.get("/settings").json()) == {"shadow_enabled": True, "source": "ledger"}
     assert L.get_setting("shadow_enabled") == "1"                      # visible on the engine's connection
     r = c.post("/settings/shadow", json={"enabled": False}, headers=CTRL)
     assert r.json()["shadow_enabled"] is False and L.get_setting("shadow_enabled") == "0"
@@ -457,7 +462,7 @@ def test_shadow_toggle_without_ledger_is_503(tmp_path, monkeypatch):
     r = c.post("/settings/shadow", json={"enabled": False}, headers=CTRL)
     assert r.status_code == 503 and "no ledger" in r.json()["detail"]
     assert not (tmp_path / "absent.db").exists()                        # the API never creates the ledger
-    assert c.get("/settings").json() == {"shadow_enabled": True, "source": "env"}
+    assert _core(c.get("/settings").json()) == {"shadow_enabled": True, "source": "env"}
 
 
 def test_shadow_toggle_on_old_schema_ledger(old_ledger_path, monkeypatch, tmp_path):
@@ -466,7 +471,7 @@ def test_shadow_toggle_on_old_schema_ledger(old_ledger_path, monkeypatch, tmp_pa
     c = TestClient(api.app)
     assert c.get("/settings").json()["source"] == "env"                 # no settings table yet: must not 500
     assert c.post("/settings/shadow", json={"enabled": False}, headers=CTRL).status_code == 200
-    assert c.get("/settings").json() == {"shadow_enabled": False, "source": "ledger"}
+    assert _core(c.get("/settings").json()) == {"shadow_enabled": False, "source": "ledger"}
     assert c.get("/trades").status_code == 200                          # read paths unaffected
 
 
@@ -559,3 +564,133 @@ def test_hosted_has_no_writes(seeded, monkeypatch):
     assert "token" not in c.get("/control/state").json()
     monkeypatch.setattr(api, "HOSTED", False)
     _nothing_written(c)
+
+
+# ---------- v0.5.0: starter book, entry style fields, /working, quote fields ----------
+def _starter_and_post(L, now):
+    L.event({"id": "e5", "source": "cnbc", "headline": "Starter news", "url": "http://x", "published_ts": now - 20,
+             "seen_ts": now - 15})
+    L.decision("e5", total_ms=300, action="PASS", reason="lean_not_decisive", venue="kalshi", market_id="MK5",
+               market_question="Q5?", p_up=.92, p_down=.03, mid_at_decision=.40, decided_ts=now - 15,
+               quote_wait_ms=42.5, n_live_quotes=3)
+    L.shadow_decision("e5", "BUY_YES", "signal_yes", "MK5")
+    L.starter_decision("e5", "BUY_YES", "signal_yes", "MK5")
+    L.trade(event_id="e5", opened_ts=now - 15, venue="kalshi", market_id="MK5", market_question="Q5?", side="yes",
+            contracts=10, avg_price=.40, cost=4.0, fee=.05, best_ask=.42, synthetic=0, shadow=0, book="starter",
+            signal_strength=.92, signal_decisive=.05, entry_style="post", order_id=7, limit_price=.40)
+    L.mark("starter:e5", 0, .42, .40, .41)
+    L.mark("starter:e5", 5, .47, .45, .46)
+
+
+def test_book_starter_filter_and_summary(seeded):
+    c, L, now = seeded
+    _starter_and_post(L, now)
+    d = c.get("/trades?book=starter").json()
+    assert [t["book"] for t in d["trades"]] == ["starter"]
+    t = d["trades"][0]
+    assert t["shadow"] is False and t["entry_style"] == "post" and t["order_id"] == 7 and t["limit_price"] == pytest.approx(.40)
+    assert len(t["path"]) == 3        # entry, +5 s starter mark (proves the starter mark key), live point
+    s = d["summary"]
+    assert s["starter_trades"] == 1 and s["books"]["starter"]["trades"] == 1
+    assert s["books"]["starter"]["pnl"] == pytest.approx(.95)
+    assert "starter" in c.get("/trades?book=all").json()["summary"]["books"]
+    assert c.get("/trades?book=bogus").status_code == 422
+
+
+def test_starter_never_counts_in_real_pnl_or_live_book(seeded):
+    c, L, now = seeded
+    before = c.get("/trades").json()["summary"]
+    _starter_and_post(L, now)
+    s = c.get("/trades").json()["summary"]
+    assert s["pnl"] == pytest.approx(before["pnl"]) and s["invested"] == pytest.approx(before["invested"])
+    assert s["live_trades"] == before["live_trades"] and s["shadow_trades"] == before["shadow_trades"]
+    assert s["books"]["live"] == before["books"]["live"]
+    assert [t["book"] for t in c.get("/trades?book=live").json()["trades"]] == ["live"]
+
+
+def test_every_trade_carries_book_style_and_order_fields(seeded):
+    c, _, _ = seeded
+    for t in c.get("/trades").json()["trades"]:
+        assert t["book"] in ("live", "shadow", "starter") and t["entry_style"] == "take"
+        assert t["order_id"] is None and "limit_price" in t
+    assert {t["book"] for t in c.get("/trades").json()["trades"]} == {"live", "shadow"}
+
+
+def test_resting_side_book_orders_show_the_chip(seeded):
+    c, L, _ = seeded
+    L.shadow_decision("e1", "BUY_YES", "post_working", "MK1")
+    L.starter_decision("e1", "BUY_YES", "post_working", "MK1")
+    e1 = {x["id"]: x for x in c.get("/decisions").json()["decisions"]}["e1"]
+    assert e1["shadow_traded"] is True and e1["starter_traded"] is True
+
+
+def test_decisions_carry_quote_and_starter_fields(seeded):
+    c, L, now = seeded
+    _starter_and_post(L, now)
+    by = {x["id"]: x for x in c.get("/decisions").json()["decisions"]}
+    e5 = by["e5"]
+    assert (e5["quote_wait_ms"], e5["n_live_quotes"]) == (42.5, 3)
+    assert (e5["starter_action"], e5["starter_reason"], e5["starter_market_id"], e5["starter_traded"]) == \
+        ("BUY_YES", "signal_yes", "MK5", True)
+    assert by["e1"]["starter_traded"] is False and by["e1"]["quote_wait_ms"] is None
+
+
+def test_working_is_empty_on_a_fresh_ledger(seeded):
+    c, _, _ = seeded
+    assert c.get("/working").json() == {"working": [], "recent": []}
+
+
+def test_working_shape_and_recent_window(seeded):
+    c, L, now = seeded
+    base = dict(venue="kalshi", market_question="Qw?", side="yes", style="post", limit_price=.54, take_price=.56,
+                requested=100, synthetic=0)
+    L.order_place(book="shadow", event_id="e1", market_id="MKW1", status="working", filled=0, created_ts=now - 60,
+                  expires_ts=now + 240, updated_ts=now - 60, **base)
+    L.order_place(book="starter", event_id="e4", market_id="MKW2", status="post_expired", filled=0, created_ts=now - 400,
+                  expires_ts=now - 100, closed_ts=now - 100, updated_ts=now - 100, **base)
+    L.order_place(book="live", event_id="e1", market_id="MKW3", status="post_expired", filled=0, created_ts=now - 200000,
+                  expires_ts=now - 199700, closed_ts=now - 199700, updated_ts=now - 199700, **base)
+    d = c.get("/working").json()
+    assert [o["market_id"] for o in d["working"]] == ["MKW1"]
+    assert [o["market_id"] for o in d["recent"]] == ["MKW2"]            # the order closed 2 days ago is out of the window
+    w = d["working"][0]
+    for k in ("id", "book", "venue", "market_id", "question", "side", "limit_price", "take_price", "requested", "filled",
+              "status", "created_ts", "expires_ts", "closed_ts", "headline", "source"):
+        assert k in w
+    assert w["headline"] == "Live news" and w["source"] == "cnbc" and w["question"] == "Qw?" and w["limit_price"] == .54
+
+
+def test_working_on_an_old_ledger_without_the_table_is_200(old_ledger_path, monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "DB_PATH", old_ledger_path)
+    monkeypatch.setattr(api, "CACHE", tmp_path / "none.json")
+    before = old_ledger_path.read_bytes()
+    r = TestClient(api.app).get("/working")
+    assert r.status_code == 200 and r.json() == {"working": [], "recent": []}
+    assert old_ledger_path.read_bytes() == before
+
+
+def test_old_ledger_trades_and_decisions_still_served_with_new_fields(old_ledger_path, monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "DB_PATH", old_ledger_path)
+    monkeypatch.setattr(api, "CACHE", tmp_path / "none.json")
+
+    async def none(market):
+        return None
+    monkeypatch.setattr(api, "_book", none)
+    c = TestClient(api.app)
+    t = c.get("/trades").json()["trades"][0]
+    assert t["book"] == "live" and t["entry_style"] == "take"
+    d = c.get("/decisions").json()["decisions"][0]
+    assert d["quote_wait_ms"] is None and d["starter_action"] is None
+
+
+def test_settings_carries_starter_and_entry_styles(seeded, monkeypatch):
+    c, _, _ = seeded
+    d = c.get("/settings").json()
+    assert d["starter_enabled"] is True and d["entry_styles"] == {"live": "take", "shadow": "post", "starter": "post"}
+    monkeypatch.setenv("STARTER_ENABLED", "false")
+    monkeypatch.setenv("ENTRY_STYLE_LIVE", "post")
+    d = c.get("/settings").json()
+    assert d["starter_enabled"] is False and d["entry_styles"]["live"] == "post"
+    monkeypatch.setenv("ENTRY_STYLE_LIVE", "limit")                       # a typo must not break the page
+    r = c.get("/settings")
+    assert r.status_code == 200 and r.json()["entry_styles"] is None

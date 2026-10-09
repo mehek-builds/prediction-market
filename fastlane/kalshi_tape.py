@@ -50,7 +50,7 @@ def move_deny_re(env=None) -> re.Pattern:
 
 class KalshiTape:
     def __init__(self, ledger, universe_ids=None, market_info=None, on_move=None, sign_headers=None,
-                 deny_re: re.Pattern | None = None):
+                 deny_re: re.Pattern | None = None, on_tick=None):
         self.ledger = ledger
         self.universe_ids = universe_ids  # callable returning a set; ticks outside it are dropped
         self.hist: dict[str, deque] = defaultdict(lambda: deque(maxlen=HISTORY_PER_MARKET))
@@ -65,6 +65,8 @@ class KalshiTape:
         self.moves = 0
         self.deny_re = deny_re
         self.moves_denied = 0
+        self.on_tick = on_tick          # callable(ticker, ts, bid, ask), synchronous, only for tickers in `watch`
+        self.watch: set[str] = set()    # maintained by PaperOrders: tickers with a working resting order
 
     def _check_move(self, ticker: str, now: float, bid: float, ask: float):
         if not self.on_move or bid <= 0 or ask >= 1 or ask - bid > MOVE_MAX_SPREAD:
@@ -117,6 +119,26 @@ class KalshiTape:
             if ts >= since_ts:
                 self.ledger.tick(ticker, ts, bid, ask)
 
+    def _record(self, ticker: str, now: float, bid: float, ask: float) -> None:
+        """One parsed ticker message: detect a move, extend the history, fire the watch hook, persist tracked ticks."""
+        last = self.hist[ticker][-1] if self.hist[ticker] else None
+        if last and last[1] == bid and last[2] == ask:
+            return  # volume-only update
+        self._check_move(ticker, now, bid, ask)
+        self.hist[ticker].append((now, bid, ask))
+        self.msgs += 1
+        if self.on_tick and ticker in self.watch:
+            try:
+                self.on_tick(ticker, now, bid, ask)
+            except Exception as exc:   # a resting-order bug must never take the tape down
+                print(f"kalshi tape on_tick error: {exc!r}")
+        until = self.tracked.get(ticker)
+        if until:
+            if now < until:
+                self.ledger.tick(ticker, now, bid, ask)
+            else:
+                del self.tracked[ticker]
+
     # ---------- stream ----------
     async def run(self):
         if self.sign_headers is None:
@@ -146,18 +168,7 @@ class KalshiTape:
                         if ids is not None and ticker not in ids:
                             continue
                         bid, ask = float(m.get("yes_bid_dollars") or 0), float(m.get("yes_ask_dollars") or 0)
-                        last = self.hist[ticker][-1] if self.hist[ticker] else None
-                        if last and last[1] == bid and last[2] == ask:
-                            continue  # volume-only update
-                        self._check_move(ticker, now, bid, ask)
-                        self.hist[ticker].append((now, bid, ask))
-                        self.msgs += 1
-                        until = self.tracked.get(ticker)
-                        if until:
-                            if now < until:
-                                self.ledger.tick(ticker, now, bid, ask)
-                            else:
-                                del self.tracked[ticker]
+                        self._record(ticker, now, bid, ask)
                 self.connected = False  # server closed the socket cleanly: back off before reconnecting
                 self.reconnects += 1
                 await asyncio.sleep(backoff)

@@ -5,7 +5,8 @@ import time
 from collections import defaultdict
 
 from fastlane.config import load_env
-from fastlane.decision import BUCKET_EDGES, DECISIVE_MIN, SIGNAL_THRESHOLD, shadow_settings, strength_bucket
+from fastlane.decision import (BUCKET_EDGES, DECISIVE_MIN, SIGNAL_THRESHOLD, shadow_settings, starter_settings,
+                               strength_bucket)
 from fastlane.ledger import DB_PATH, columns, mark_key
 
 HORIZONS = [0, 5, 30, 60, 300, 900, 3600]
@@ -33,10 +34,12 @@ def main(since_minutes: float | None):
         return
     db = sqlite3.connect(DB_PATH)
     since = time.time() - since_minutes * 60 if since_minutes else 0
-    rows = db.execute("""
+    quote_col = "d.quote_wait_ms" if "quote_wait_ms" in columns(db, "decisions") else "NULL"   # 0.5.0 column
+    rows = db.execute(f"""
         SELECT e.id, e.source, e.headline, e.published_ts, e.seen_ts, e.synthetic,
                d.decided_ts, d.n_candidates, d.shortlist_ms, d.jev_ms, d.book_ms, d.total_ms,
-               d.action, d.reason, d.market_id, d.market_question, d.p_up, d.p_down, d.materiality, d.market_conf
+               d.action, d.reason, d.market_id, d.market_question, d.p_up, d.p_down, d.materiality, d.market_conf,
+               {quote_col}
         FROM events e JOIN decisions d ON d.event_id = e.id
         WHERE e.seen_ts > ? AND e.synthetic = 0""", (since,)).fetchall()
     if not rows:
@@ -47,6 +50,7 @@ def main(since_minutes: float | None):
     print("Pipeline stages (our code, per event):")
     print(row("market match (shortlist)", [r[8] for r in rows]))
     print(row("Jev decision call", [r[9] for r in rows]))
+    print(row("live quote wait after Jev", [r[20] for r in rows]))
     print(row("order-book wait after Jev", [r[10] for r in rows]))
     print(row("seen -> decision (total)", [r[11] for r in rows]))
 
@@ -100,15 +104,19 @@ def main(since_minutes: float | None):
     timeline(db, rows)
 
     cols = columns(db, "trades")
+    book_expr = ("COALESCE(book, CASE WHEN shadow = 1 THEN 'shadow' ELSE 'live' END)" if "book" in cols else
+                 ("CASE WHEN shadow = 1 THEN 'shadow' ELSE 'live' END" if "shadow" in cols else "'live'"))
     all_trades = db.execute(f"""SELECT event_id, venue, market_question, side, contracts, avg_price, cost, fee, opened_ts,
                            {"shadow" if "shadow" in cols else "0 AS shadow"},
-                           {"signal_strength" if "signal_strength" in cols else "NULL AS signal_strength"}
+                           {"signal_strength" if "signal_strength" in cols else "NULL AS signal_strength"},
+                           {book_expr} AS book
                            FROM trades WHERE synthetic = 0 AND opened_ts > ?""", (since,)).fetchall()
-    trades = [t for t in all_trades if not t[9]]   # the real paper book
-    shadow = [t for t in all_trades if t[9]]       # what the looser shadow rule would have added
+    trades = [t for t in all_trades if t[11] == "live"]       # the real paper book
+    shadow = [t for t in all_trades if t[11] == "shadow"]     # what the looser shadow rule would have added
+    starter = [t for t in all_trades if t[11] == "starter"]   # the small stricter-than-shadow book
     print(f"\nPaper trades: {len(trades)}")
     tot = defaultdict(float)
-    for eid, venue, q, side, n, px, cost, fee, ts, _sh, _sig in trades:
+    for eid, venue, q, side, n, px, cost, fee, ts, _sh, _sig, _book in trades:
         m = marks.get(eid, {})
         cells = []
         for h in HORIZONS[1:]:
@@ -123,11 +131,14 @@ def main(since_minutes: float | None):
     if trades:
         print("  Total mark-to-bid P&L: " + "  ".join(f"+{h}s ${v:+.2f}" for h, v in sorted(tot.items())))
     shadow_section(trades, shadow, marks, {r[0]: r[13] for r in rows})
+    starter_section(starter, marks)
+    orders_section(db, since)
+    releases_section(db, marks, since)
 
 
 def _per_contract(t, m):
     """{horizon: P&L per contract after spread (exit at the held-side bid) and fees} for one trade."""
-    _eid, _venue, _q, side, n, px, _cost, fee, _ts, _sh, _sig = t
+    _eid, _venue, _q, side, n, px, _cost, fee, _ts, _sh, _sig = t[:11]
     out = {}
     for h in HORIZONS[1:]:
         if h in m:
@@ -155,7 +166,7 @@ def shadow_section(real, shadow, marks, reasons):
     unknown = [t for t in shadow if strength_bucket(t[10]) is None]
     if unknown:
         groups.append(("shadow unknown", unknown))
-    stats = [(name, ts, [_per_contract(t, marks.get(mark_key(t[0], t[9]), {})) for t in ts])
+    stats = [(name, ts, [_per_contract(t, marks.get(mark_key(t[0], t[11] if len(t) > 11 else t[9]), {})) for t in ts])
              for name, ts in groups if ts]
     horizons = [h for h in HORIZONS[1:] if any(h in pc for _, _, pcs in stats for pc in pcs)]
     print(f"  {'book / signal':18} {'n':>3}" + "".join(f"   {'+' + str(h) + 's avg':>11}   up/down" for h in horizons))
@@ -174,6 +185,87 @@ def shadow_section(real, shadow, marks, reasons):
         for t in shadow:
             why[reasons.get(t[0]) or "unknown"] += 1
         print("  shadow trades by real reason: " + ", ".join(f"{k} {v}" for k, v in sorted(why.items())))
+
+
+def _pnl_by_horizon(trades, marks, book) -> dict:
+    """{horizon: total mark-to-bid P&L in dollars} for trades of one book."""
+    tot = defaultdict(float)
+    for t in trades:
+        eid, _venue, _q, side, n, _px, cost, fee = t[:8]
+        for h, (ya, yb, _mid) in marks.get(mark_key(eid, book), {}).items():
+            if h == 0:
+                continue
+            exit_px = yb if side == "yes" else (1 - ya if ya is not None else None)
+            if exit_px is not None:
+                tot[h] += n * exit_px - cost - fee
+    return dict(tot)
+
+
+def starter_section(starter, marks):
+    """The starter book (small fixed size, strength >= STARTER_SIGNAL_THRESHOLD, no decisive requirement)."""
+    enabled, sig, dec, size = starter_settings()
+    print(f"\nStarter book{'' if enabled else ' (disabled)'} (signal >= {sig:.2f}, decisive >= {dec:.2f}, ${size:g} a trade; paper only).")
+    if not starter:
+        print("  no starter trades in range")
+        return
+    invested = sum(t[6] + t[7] for t in starter)
+    tot = _pnl_by_horizon(starter, marks, "starter")
+    print(f"  trades {len(starter)}  invested ${invested:.2f}  mark-to-bid P&L: "
+          + ("  ".join(f"+{h}s ${v:+.2f}" for h, v in sorted(tot.items())) or "no marks yet"))
+
+
+def orders_section(db, since):
+    """Working and expired resting paper orders (ENTRY_STYLE=post): outcomes by book, fill ratio, time to first fill, and
+    how many cents the resting price saved against the take price."""
+    if "status" not in columns(db, "paper_orders"):
+        return
+    orders = db.execute("SELECT id, book, status, limit_price, take_price, filled, requested, created_ts "
+                        "FROM paper_orders WHERE created_ts > ? AND synthetic = 0", (since,)).fetchall()
+    print("\nWorking and expired orders (resting paper bids):")
+    if not orders:
+        print("  none in range")
+        return
+    first = dict(db.execute("SELECT order_id, MIN(ts) FROM paper_fills GROUP BY order_id").fetchall())
+    by = defaultdict(lambda: defaultdict(int))
+    for _id, book, status, *_ in orders:
+        by[book][status] += 1
+    for book, c in sorted(by.items()):
+        done = sum(v for k, v in c.items() if k != "working")
+        got = c.get("filled", 0) + c.get("partial_expired", 0)
+        ratio = f"{got}/{done} ({got / done:.0%})" if done else "-"
+        print(f"  {book:8} " + ", ".join(f"{k} {v}" for k, v in sorted(c.items())) + f" | fill ratio {ratio}")
+    waits = [first[o[0]] - o[7] for o in orders if o[0] in first]
+    if waits:
+        print(row("time to first fill", waits, unit="s"))
+    for book in sorted(by):
+        saved = [(o[4] - o[3]) * 100 for o in orders if o[1] == book and o[5] > 0 and o[4] is not None]
+        if saved:
+            print(f"  {book:8} spread saved on filled orders: avg {sum(saved) / len(saved):+.1f}c (limit vs take price, n={len(saved)})")
+
+
+def releases_section(db, marks, since):
+    """Trades placed on scheduled data releases (events from release:<SERIES>), with their P&L per horizon."""
+    if "status" not in columns(db, "releases"):
+        return
+    rel = db.execute("""SELECT e.id, e.source, t.market_id, t.side, t.avg_price, t.contracts, t.cost, t.fee,
+                               (SELECT r.value FROM releases r WHERE r.series LIKE '%' || substr(e.source, 9) || '%'
+                                  AND e.id LIKE '%' || r.period LIMIT 1)
+                        FROM events e JOIN trades t ON t.event_id = e.id
+                        WHERE e.source LIKE 'release:%' AND e.seen_ts > ?""", (since,)).fetchall()
+    print("\nRelease trades:")
+    if not rel:
+        print("  none in range")
+        return
+    for eid, src, mkt, side, px, n, cost, fee, value in rel:
+        m = marks.get(eid, {})
+        cells = []
+        for h in HORIZONS[1:]:
+            if h in m:
+                ya, yb, _ = m[h]
+                exit_px = yb if side == "yes" else (1 - ya if ya is not None else None)
+                if exit_px is not None:
+                    cells.append(f"+{h}s ${n * exit_px - cost - fee:+.2f}")
+        print(f"  {src:22} value {value if value is not None else '?'}  {side.upper()} {n:g} @ {px} {mkt}  " + "  ".join(cells))
 
 
 def timeline(db, rows):

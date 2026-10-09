@@ -112,7 +112,12 @@ def test_env_example_has_no_values_and_all_vars():
                 "PAPER_BANKROLL_USD", "PAPER_MAX_TRADE_PCT", "PAPER_DAILY_LOSS_HALT_PCT",
                 "SHADOW_ENABLED", "SHADOW_SIGNAL_THRESHOLD", "SHADOW_DECISIVE_MIN", "MAX_SPREAD_CENTS", "COST_TO_ROOM_MAX",
                 "XAI_API_KEY", "XAI_X_HANDLES", "XAI_POLL_SECONDS", "XAI_DAILY_BUDGET_USD", "XAI_WINDOW_DAYS",
-                "XAI_WINDOW_HOURS", "XAI_WINDOW_TZ", "BSKY_ENABLED", "BSKY_HANDLES", "MIN_ENTRY_PRICE", "MOVE_DENY_RE"]:
+                "XAI_WINDOW_HOURS", "XAI_WINDOW_TZ", "BSKY_ENABLED", "BSKY_HANDLES", "MIN_ENTRY_PRICE", "MOVE_DENY_RE",
+                "LIVE_QUOTE_WAIT_MS", "ENTRY_STYLE", "ENTRY_STYLE_LIVE", "ENTRY_STYLE_SHADOW", "ENTRY_STYLE_STARTER",
+                "POST_MAX_WAIT_S", "POST_POLL_S", "POST_MAX_WORKING", "STARTER_ENABLED", "STARTER_SIGNAL_THRESHOLD",
+                "STARTER_DECISIVE_MIN", "STARTER_SIZE_USD", "RELEASES_ENABLED", "BLS_API_KEY", "RELEASE_POLL_START_S",
+                "RELEASE_POLL_EVERY_S", "RELEASE_POLL_MAX_S", "RELEASE_BLS_DAILY_BUDGET", "RELEASE_MARGIN_CPI_PP",
+                "RELEASE_MARGIN_PAYROLLS_K", "RELEASE_MAX_MARKETS_PER_SERIES"]:
         assert re.search(rf"^{var}=", text, re.M), var
     for gone in ["KALSHI_ENV", "X_BEARER_TOKEN", "X_LIST_ID"]:
         assert gone not in text
@@ -122,3 +127,38 @@ def test_version_matches_changelog_head():
     import fastlane
     head = re.search(r"^## (\d+\.\d+\.\d+)", (ROOT / "CHANGELOG.md").read_text(), re.M).group(1)
     assert head == fastlane.__version__
+
+
+def test_version_is_0_5_0():
+    import fastlane
+    assert fastlane.__version__ == "0.5.0"
+    assert re.search(r"^## 0\.5\.0 - \d{4}-\d{2}-\d{2}$", (ROOT / "CHANGELOG.md").read_text(), re.M)
+
+
+def test_release_calendar_parses_and_keeps_its_todo_when_it_has_empty_kinds():
+    import json
+    from fastlane import releases
+    data = json.loads((ROOT / "fastlane" / "release_calendar.json").read_text())
+    assert data["version"] == 1 and isinstance(data["events"], list)
+    if not data["events"]:
+        assert "todo" in data
+    entries = releases.load_calendar()                   # every committed entry validates
+    kinds = {e.kind for e in entries}
+    if not ({"cpi", "jobs"} <= kinds):
+        assert "todo" in data                             # BLS dates unfilled: the instructions stay in the file
+    assert set(data["sources"]) == {"cpi", "jobs", "fomc"}
+    assert all(e.date for e in entries) and len({e.release_id for e in entries}) == len(entries)
+
+
+def test_release_fixtures_are_committed_for_every_series():
+    fx = ROOT / "tests" / "fixtures" / "release_rules"
+    assert sorted(p.stem for p in fx.glob("*.json")) == ["KXCPI", "KXCPIYOY", "KXFED", "KXFEDDECISION", "KXPAYROLLS", "KXU3"]
+
+
+def test_new_modules_make_no_non_get_requests():
+    for name in ("releases.py", "orders.py", "replay.py"):
+        text = (ROOT / "fastlane" / name).read_text()
+        assert not re.search(r"\.(post|put|delete|patch|request)\(", text), name
+        assert not re.search(r"[\"']POST[\"']", text), name
+        assert not re.search(r"/orders\b", text), name
+        assert not re.search(r"\b(amend|batch)\b", text, re.I), name

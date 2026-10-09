@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.5.0 - 2026-10-10
+
+### Added
+- Live quotes in market selection. After Jev answers, the engine waits at most `LIVE_QUOTE_WAIT_MS` (default 150 ms)
+  for the order books it fetched while Jev was thinking, and ranks the candidate markets on those live prices, not
+  the up-to-15-minute-old cache. `decide()` takes `quotes=` (live ask and bid per candidate). A live book with
+  nothing to buy on the signalled side counts as no room, and a lone such signal is `PASS no_fill_within_limit`.
+  The decision row and `/decisions` carry `quote_wait_ms` and `n_live_quotes`; the console line shows
+  `quotes <ms>/<n>`; the dashboard LATENCY table has a QUOTES row.
+- Entry style `take` or `post` per paper book (`ENTRY_STYLE`, `ENTRY_STYLE_LIVE`, `ENTRY_STYLE_SHADOW`,
+  `ENTRY_STYLE_STARTER`). `post` rests a paper bid at best bid + 1 cent (never at or above the ask) and fills only
+  when a fresh book snapshot shows the opposite side at our limit or better, at our limit price, for the displayed
+  size (`fastlane/orders.py`, tables `paper_orders` and `paper_fills`, expiry `POST_MAX_WAIT_S`, at most
+  `POST_MAX_WORKING` at once). A Kalshi tape tick wakes a snapshot early but never fills. Defaults: LIVE `take`
+  (it mirrors the real order), SHADOW and STARTER `post`. Dashboard WORKING ORDERS panel, `GET /working`, `POST`
+  chip on cards, entry price tooltip with the limit and the take price, new reasons `post_working`, `post_expired`,
+  `post_queue_full`.
+- Starter book: a third paper book (strength >= 0.90, no decisive requirement, `STARTER_SIZE_USD`, default $20),
+  evaluated only when the real rule passed. Env only (`STARTER_*`). Dashboard key `5`, BOOKS row, `/trades?book=starter`,
+  `summary.books.starter`; never in the real totals, never a real order. `trades.book` column (live, shadow, starter),
+  backfilled on open.
+- Scheduled data releases (`fastlane/releases.py`, `fastlane/release_calendar.json`): CPI (`KXCPI`, `KXCPIYOY`), jobs
+  report (`KXPAYROLLS`, `KXU3`) and FOMC statement (`KXFED`, `KXFEDDECISION`). The number is read from BLS (v2 API,
+  registration key required, request budget counted in the ledger before each request) or the Federal Reserve
+  statement feed, compared with each Kalshi threshold market, and bought in the LIVE paper book without a Jev call.
+  Markets are traded only if their rules text matches the template captured from the live Kalshi rules, CPI values
+  near a rounding boundary and payrolls near a strike are skipped, and an FOMC statement that does not parse to one
+  25 bp range is not traded. `python3 -m fastlane.releases --check` prints the calendar, the market parse table and the
+  BLS budget without trading. Tables `releases`, `release_markets`, `bls_requests`.
+- `python3 -m fastlane.replay`: re-reads the last hours of blocked real-rule signals against the new selection rule
+  from stored marks, ticks and answers. Read only; never claims a P&L.
+- Report: live-quote-wait row, starter book, working and expired orders (fill ratio, time to first fill, spread
+  saved) and release trades sections.
+- `KalshiTape` accepts an `on_tick` callback for watched tickers.
+
+### Changed
+- Market selection ranks on live book prices (see above). A signal whose live book is already at 95c or more is
+  `priced_in` even when the cached quote was cheap, and a cheap-looking cached market is no longer chosen over a
+  market with real room.
+- `GET /settings` also returns `starter_enabled` and `entry_styles`; trades carry `book`, `entry_style`, `order_id`
+  and `limit_price`; `/decisions` rows carry the starter fields and the quote timings.
+- Every paper book enters through one method, so the freshness, cost and position guards are identical for the real,
+  shadow, starter and release paths.
+- Real trading (`fastlane/live.py`) unchanged: immediate-or-cancel buys only, at the paper take limit; a resting paper
+  order never becomes a real order. With real money armed the LIVE book takes on Kalshi whatever `ENTRY_STYLE_LIVE`
+  says.
+- Ledger changes are additive; a 0.4.0 binary can still open a 0.5.0 ledger (see ROLLBACK.md for the starter caveat).
+
 ## 0.4.0 - 2026-10-09
 
 ### Added

@@ -63,3 +63,61 @@ def test_source_lag_section_with_fast_sources(tmp_ledger, tmp_path, monkeypatch,
     out = capsys.readouterr().out
     assert "bsky:reuters.com" in out and "x:DeItaone" in out and "trumpstruth" in out
     assert out.index("bsky:reuters.com") < out.index("x:DeItaone") < out.index("trumpstruth")   # sorted by p50 lag
+
+
+def _report_ledger(tmp_ledger):
+    import time
+    now = time.time(); L = tmp_ledger
+    for eid, sec in (("r1", 300), ("r2", 200), ("r3", 100)):
+        src = "release:KXCPI" if eid == "r3" else "cnbc"
+        L.event({"id": eid, "source": src, "headline": eid, "seen_ts": now - sec, "published_ts": now - sec - 5})
+    L.release_put(id="cpi-2026-09", kind="cpi", series="KXCPI,KXCPIYOY", period="2026-09", value=0.4, status="done")
+    L.decision("r1", action="BUY_YES", reason="signal_yes", venue="kalshi", market_id="MK1", decided_ts=now - 300,
+               jev_ms=500, book_ms=10, total_ms=600, shortlist_ms=2, quote_wait_ms=40.0, n_live_quotes=3)
+    L.decision("r2", action="PASS", reason="lean_not_decisive", venue="kalshi", market_id="MK2", decided_ts=now - 200,
+               total_ms=500, quote_wait_ms=60.0, n_live_quotes=2)
+    L.decision("r3", action="BUY_YES", reason="release_yes", venue="kalshi", market_id="MK3", decided_ts=now - 100, total_ms=900)
+    base = dict(venue="kalshi", side="yes", contracts=10, avg_price=.40, cost=4.0, fee=.05, best_ask=.40, synthetic=0)
+    L.trade(event_id="r1", opened_ts=now - 300, market_id="MK1", market_question="Q1", shadow=0, signal_strength=.9, **base)
+    L.trade(event_id="r2", opened_ts=now - 200, market_id="MK2", market_question="Q2", book="starter", shadow=0,
+            signal_strength=.92, entry_style="post", **base)
+    L.trade(event_id="r3", opened_ts=now - 100, market_id="MK3", market_question="Q3", shadow=0, signal_strength=1.0, **base)
+    L.mark("r1", 30, .47, .45, .46)
+    L.mark("starter:r2", 30, .52, .50, .51)
+    L.mark("r3", 30, .50, .48, .49)
+    o = dict(venue="kalshi", side="yes", style="post", limit_price=.40, take_price=.42, requested=10, synthetic=0)
+    L.order_place(book="shadow", market_id="MS1", status="filled", filled=10, created_ts=now - 150, closed_ts=now - 140,
+                  updated_ts=now - 140, **o)
+    L.order_place(book="starter", market_id="MS2", status="post_expired", filled=0, created_ts=now - 400, closed_ts=now - 100,
+                  updated_ts=now - 100, **o)
+    L.fill_add(order_id=1, ts=now - 140, contracts=10, price=.40, evidence="{}", ask_seen=.40, qty_seen=10)
+    return L
+
+
+def test_report_v050_sections(tmp_ledger, tmp_path, monkeypatch, capsys):
+    _report_ledger(tmp_ledger)
+    monkeypatch.setattr(report, "DB_PATH", tmp_path / "ledger.db")
+    report.main(None)
+    out = capsys.readouterr().out
+    assert "live quote wait after Jev" in out
+    assert "Starter book (signal >= 0.90" in out and "trades 1  invested $4.05" in out and "+30s $+0.95" in out
+    assert "Working and expired orders" in out and "shadow   filled 1" in out and "starter  post_expired 1" in out
+    assert "spread saved on filled orders: avg +2.0c" in out
+    assert "Release trades:" in out and "none in range" not in out and "KXCPI" in out.split("Release trades:")[1]
+
+
+def test_report_starter_trades_are_not_in_the_real_paper_count(tmp_ledger, tmp_path, monkeypatch, capsys):
+    _report_ledger(tmp_ledger)
+    monkeypatch.setattr(report, "DB_PATH", tmp_path / "ledger.db")
+    report.main(None)
+    assert "Paper trades: 2" in capsys.readouterr().out                  # r1 and r3; the starter trade r2 is separate
+
+
+def test_report_on_a_ledger_without_orders_or_starter_does_not_raise(tmp_ledger, tmp_path, monkeypatch, capsys):
+    import time
+    now = time.time()
+    tmp_ledger.event({"id": "e1", "source": "cnbc", "headline": "x", "seen_ts": now - 10, "published_ts": now - 20})
+    tmp_ledger.decision("e1", action="PASS", reason="weak_signal", venue="kalshi", market_id="MK1", decided_ts=now - 10)
+    monkeypatch.setattr(report, "DB_PATH", tmp_path / "ledger.db")
+    report.main(None)
+    assert "Starter book" in capsys.readouterr().out

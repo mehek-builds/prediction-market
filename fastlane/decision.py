@@ -24,6 +24,18 @@ SHADOW_DECISIVE_MIN = 0.0
 SHADOW_ENABLED = True
 BUCKET_EDGES = (0.60, 0.70, SIGNAL_THRESHOLD)  # shadow P&L is reported per strength bucket to find the cutoff
 
+# Starter book: a third paper book with a small fixed size and a stricter strength bar than shadow, no decisive
+# requirement. Env only (STARTER_*), never touches the real book or real orders.
+STARTER_SIGNAL_THRESHOLD = 0.90
+STARTER_DECISIVE_MIN = 0.0
+STARTER_ENABLED = True
+STARTER_SIZE_USD = 20.0
+
+# How a paper entry is placed: "take" crosses the spread now (the fill the real IOC order mirrors), "post" rests a bid
+# inside the spread and fills only if the opposite side comes to us (the orders module).
+ENTRY_STYLES = ("take", "post")
+ENTRY_STYLE_DEFAULTS = {"live": "take", "shadow": "post", "starter": "post"}
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
@@ -34,6 +46,33 @@ def shadow_settings() -> tuple[bool, float, float]:
     """(enabled, signal_threshold, decisive_min) from SHADOW_ENABLED / SHADOW_SIGNAL_THRESHOLD / SHADOW_DECISIVE_MIN."""
     enabled = os.environ.get("SHADOW_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
     return enabled, _env_float("SHADOW_SIGNAL_THRESHOLD", SHADOW_SIGNAL_THRESHOLD), _env_float("SHADOW_DECISIVE_MIN", SHADOW_DECISIVE_MIN)
+
+
+def starter_settings() -> tuple[bool, float, float, float]:
+    """(enabled, signal_threshold, decisive_min, size_usd) from STARTER_ENABLED / STARTER_SIGNAL_THRESHOLD /
+    STARTER_DECISIVE_MIN / STARTER_SIZE_USD."""
+    enabled = os.environ.get("STARTER_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    return (enabled, _env_float("STARTER_SIGNAL_THRESHOLD", STARTER_SIGNAL_THRESHOLD),
+            _env_float("STARTER_DECISIVE_MIN", STARTER_DECISIVE_MIN), _env_float("STARTER_SIZE_USD", STARTER_SIZE_USD))
+
+
+def entry_styles() -> dict[str, str]:
+    """{"live": .., "shadow": .., "starter": ..}, each "take" or "post". Defaults live=take, shadow=post, starter=post.
+    ENTRY_STYLE (if set) replaces all three; ENTRY_STYLE_LIVE / _SHADOW / _STARTER then override one book each.
+    Values are lower-cased and stripped, empty means unset; anything else raises ValueError."""
+    def read(name: str) -> str | None:
+        raw = os.environ.get(name, "").strip().lower()
+        if not raw:
+            return None
+        if raw not in ENTRY_STYLES:
+            raise ValueError(f"{name} must be one of {', '.join(ENTRY_STYLES)} (got {raw!r})")
+        return raw
+
+    global_style = read("ENTRY_STYLE")
+    out = {book: global_style or default for book, default in ENTRY_STYLE_DEFAULTS.items()}
+    for book in out:
+        out[book] = read(f"ENTRY_STYLE_{book.upper()}") or out[book]
+    return out
 
 
 def cost_settings() -> tuple[float, float, float]:
@@ -83,30 +122,45 @@ def _qualifies(c: dict, signal_threshold: float = SIGNAL_THRESHOLD, decisive_min
     return c["strength"] >= signal_threshold and c["p_decisive"] >= decisive_min
 
 
-def decide(answers: dict, keyed: dict | None = None, *,
+def decide(answers: dict, keyed: dict | None = None, *, quotes: dict | None = None,
            signal_threshold: float = SIGNAL_THRESHOLD, decisive_min: float = DECISIVE_MIN) -> dict:
     """Score every candidate, then pick the qualifying one with the most room to profit.
 
-    Room = 1 - entry price on the signalled side, from the cached quote (the live book is used for the fill).
+    Room = 1 - entry price on the signalled side. `quotes` ({key: {"yes_ask", "yes_bid"}} from live order books) REPLACE
+    the cached `keyed` prices for the keys they cover, including a None (the live book has no price on that side);
+    keys absent from `quotes` use the cache exactly as before. With a live quote and no entry on the signalled side the
+    candidate has room 0.0 and `no_ask=True` (nothing to buy). With no usable cached quote room is 0.5 (unknown).
     Qualifiers with no room (entry at or above MAX_ENTRY_PRICE, so the fill guard would refuse them anyway) are dropped; if
-    only such qualifiers exist the answer is PASS / priced_in and the market is still tracked.
+    only such qualifiers exist the answer is PASS / priced_in (PASS / no_fill_within_limit when the strongest has
+    nothing to buy) and the market is still tracked.
     Without qualifiers, report the strongest candidate so it can still be tracked for calibration.
-    Thresholds are parameters so the shadow rule (looser, separate paper book) can reuse the exact same scoring, room
-    ranking and no-room fallback; the defaults are the real rule. The cost filter is a separate guard on the live book
-    (`books.cost_block`), applied by the engine after selection.
+    Thresholds are parameters so the shadow and starter rules (looser, separate paper books) can reuse the exact same
+    scoring, room ranking and no-room fallback; the defaults are the real rule. The cost filter is a separate guard on
+    the live book (`books.cost_block`), applied by the engine after selection.
+    The result also carries `entry` (float | None) and `quote_source` ("live" | "cache" | "none") for the chosen key.
+    Pure: no I/O, no clock.
     """
     keyed = keyed or {}
+    quotes = quotes or {}
     cands = []
     for key, a in answers.items():
         p = a.get("probabilities") or {}
         yes = p.get("decisive_yes", 0) + p.get("toward_yes", 0)
         no = p.get("decisive_no", 0) + p.get("toward_no", 0)
         side = "yes" if yes >= no else "no"
-        m = keyed.get(key, {})
-        entry = m.get("yes_ask") if side == "yes" else (1 - m["yes_bid"] if m.get("yes_bid") else None)
-        cands.append({"key": key, "side": side, "p_yes_side": yes, "p_no_side": no,
-                      "p_decisive": p.get(f"decisive_{side}", 0), "strength": max(yes, no),
-                      "room": (1 - entry) if entry else 0.5})
+        if key in quotes:
+            src, q = "live", quotes[key] or {}
+        else:
+            src, q = "cache", keyed.get(key, {})
+        entry = q.get("yes_ask") if side == "yes" else (1 - q["yes_bid"] if q.get("yes_bid") else None)
+        entry = entry or None
+        cand = {"key": key, "side": side, "p_yes_side": yes, "p_no_side": no,
+                "p_decisive": p.get(f"decisive_{side}", 0), "strength": max(yes, no),
+                "room": (1 - entry) if entry else 0.5, "entry": entry,
+                "quote_source": src if (entry or src == "live") else "none"}
+        if src == "live" and not entry:
+            cand["room"], cand["no_ask"] = 0.0, True
+        cands.append(cand)
     if not cands:
         return {"action": "PASS", "reason": "no_answers", "key": None}
     signalled = [c for c in cands if _qualifies(c, signal_threshold, decisive_min)]
@@ -116,7 +170,7 @@ def decide(answers: dict, keyed: dict | None = None, *,
         return {**best, "action": "BUY_YES" if best["side"] == "yes" else "BUY_NO", "reason": f"signal_{best['side']}"}
     if signalled:  # a correct call on a market already priced near certainty: nothing left to win, track it only
         best = max(signalled, key=lambda c: c["strength"])
-        return {**best, "action": "PASS", "reason": "priced_in"}
+        return {**best, "action": "PASS", "reason": "no_fill_within_limit" if best.get("no_ask") else "priced_in"}
     best = max(cands, key=lambda c: c["strength"])
     if best["strength"] < MARK_THRESHOLD:
         return {**best, "action": "PASS", "reason": "irrelevant", "key": None}

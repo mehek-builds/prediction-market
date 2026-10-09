@@ -138,3 +138,54 @@ def test_deny_env_override_and_validation(monkeypatch):
         kalshi_tape.move_deny_re()
     monkeypatch.setenv("MOVE_DENY_RE", "")
     assert kalshi_tape.move_deny_re().pattern == kalshi_tape.MOVE_DENY_DEFAULT
+
+
+# ---------- v0.5.0: on_tick hook for resting paper orders ----------
+def test_on_tick_fires_only_for_watched_tickers_synchronously_with_the_quote():
+    calls = []
+    tape = KalshiTape(StubLedger(), on_tick=lambda *a: calls.append(a))
+    tape.watch.add("EV-A")
+    tape._record("EV-A", 1000.0, .40, .42)
+    tape._record("EV-B", 1000.0, .40, .42)               # not watched
+    assert calls == [("EV-A", 1000.0, .40, .42)]
+    assert tape.hist["EV-B"] and tape.msgs == 2          # still recorded, just no callback
+
+
+def test_on_tick_skips_volume_only_updates_and_unwatched_after_discard():
+    calls = []
+    tape = KalshiTape(StubLedger(), on_tick=lambda *a: calls.append(a))
+    tape.watch.add("EV-A")
+    tape._record("EV-A", 1000.0, .40, .42)
+    tape._record("EV-A", 1001.0, .40, .42)               # same quote: not a tick
+    tape._record("EV-A", 1002.0, .41, .43)
+    assert [c[1] for c in calls] == [1000.0, 1002.0]
+    tape.watch.discard("EV-A")
+    tape._record("EV-A", 1003.0, .50, .52)
+    assert len(calls) == 2
+
+
+def test_on_tick_runs_after_history_is_extended():
+    seen = []
+    tape = KalshiTape(StubLedger())
+    tape.on_tick = lambda t, ts, b, a: seen.append(tape.quote(t))
+    tape.watch.add("EV-A")
+    tape._record("EV-A", 1000.0, .40, .42)
+    assert seen == [(1000.0, .40, .42)]
+
+
+def test_a_failing_on_tick_never_breaks_the_tape(capsys):
+    def boom(*a):
+        raise RuntimeError("order bug")
+    tape = KalshiTape(StubLedger(), on_tick=boom)
+    tape.watch.add("EV-A")
+    tape._record("EV-A", 1000.0, .40, .42)
+    tape._record("EV-A", 1001.0, .41, .43)
+    assert tape.msgs == 2 and "on_tick error" in capsys.readouterr().out
+
+
+def test_no_hook_and_tracked_ticks_still_persist():
+    tape = KalshiTape(StubLedger())
+    tape.watch.add("EV-A")
+    tape.tracked["EV-A"] = time.time() + 100
+    tape._record("EV-A", time.time(), .40, .42)
+    assert len(tape.ledger.ticks) == 1

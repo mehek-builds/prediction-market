@@ -3,7 +3,9 @@
 Paper by default. The only path to a real order is `self.live` (fastlane/live.py), and it stays closed unless the
 user enabled real trading in .env AND flipped the dashboard switch for this engine session.
 Shadow mode is a runtime switch read from the ledger (`Engine.shadow_enabled`, cached 2 s) and never touches the
-real or the live path.
+real or the live path. The starter book (env STARTER_*) is a third paper book with the same isolation.
+Every paper book enters through one method (`Engine._execute`): guards first, then either a take fill (cross the spread
+now) or a resting paper order (the orders module). Only a LIVE-book take fill can reach `_real_order`.
 """
 import asyncio
 import os
@@ -12,19 +14,20 @@ import time
 
 import httpx
 
-from fastlane import backup, errors, live
+from fastlane import backup, errors, live, releases
 from fastlane.bluesky import BlueskyFeed
-from fastlane.books import COST_BLOCK_REASONS, cost_block, fetch_book, simulate_fill
+from fastlane.books import COST_BLOCK_REASONS, TICK, Book, cost_block, fetch_book, post_limit, simulate_fill
 from fastlane.config import KALSHI_PROD_BASE, kalshi_api_url, kalshi_base_url
-from fastlane.decision import build_request, cost_settings, decide, shadow_settings
+from fastlane.decision import build_request, cost_settings, decide, entry_styles, shadow_settings, starter_settings
 from fastlane.feeds import FeedHub
 from fastlane.jev_client import JevClient
 from fastlane.kalshi import KalshiClient
 from fastlane.kalshi_tape import KalshiTape, move_deny_re
-from fastlane.ledger import Ledger, mark_key, shadow_enabled_from
+from fastlane.ledger import BOOK_SQL, Ledger, mark_key, shadow_enabled_from
 from fastlane.live import LiveTrader
+from fastlane.orders import PaperOrders
 from fastlane.ratelimit import JevBudget, env_float
-from fastlane.universe import Universe
+from fastlane.universe import Universe, is_sports_market
 from fastlane.x_feed import XFeed
 
 MARK_HORIZONS_S = [5, 30, 60, 300, 900, 3600]
@@ -56,6 +59,36 @@ def freshness_block(ev: dict, mid_at_published: float | None, mid_now: float | N
 
 def _fmt_ms(x):
     return f"{x:6.0f}ms" if x is not None else "     - "
+
+
+def _quotes_cell(rec: dict) -> str:
+    w = rec.get("quote_wait_ms")
+    return f"{w:.0f}ms/{rec.get('n_live_quotes', 0)}" if w is not None else "-"
+
+
+class PrefetchPool:
+    """The prefetched book tasks that the shadow and starter passes share (read only: nobody pops a task another pass may
+    still need). Each pass calls acquire() when it is handed the pool and release() when it finishes; the LAST release
+    cancels whatever is still in flight."""
+
+    def __init__(self, tasks: dict[str, asyncio.Task]):
+        self.tasks = tasks
+        self.holders = 0
+
+    def get(self, market_id: str) -> asyncio.Task | None:
+        return self.tasks.get(market_id)
+
+    def acquire(self) -> None:
+        self.holders += 1
+
+    def release(self) -> None:
+        self.holders = max(0, self.holders - 1)
+        if self.holders == 0:
+            self.cancel_all()
+
+    def cancel_all(self) -> None:
+        for t in self.tasks.values():
+            t.cancel()
 
 
 class Engine:
@@ -90,13 +123,26 @@ class Engine:
         self.tape = KalshiTape(self.ledger, universe_ids=lambda: self.kalshi_ids,
                                market_info=self.by_id.get, on_move=self._on_move,
                                sign_headers=self.kalshi.sign_headers if self.tape_enabled else None,
-                               deny_re=move_deny_re())
+                               deny_re=move_deny_re(),
+                               on_tick=lambda ticker, ts, bid, ask: self.orders.on_tick(ticker, ts, bid, ask))
+        self.styles = entry_styles()                # {"live", "shadow", "starter"} -> "take" | "post"
+        self.quote_wait_s = max(env_float("LIVE_QUOTE_WAIT_MS", 150), 0.0) / 1000
+        self.starter_on, self.starter_signal, self.starter_decisive, self.starter_size = starter_settings()
+        # Late-bound fetch so a patched/replaced module-level fetch_book is honoured by the resting-order and release paths.
+        self.orders = PaperOrders(self.ledger, self.http, fetch_book=lambda c, m: fetch_book(c, m),
+                                  on_fill=self._on_paper_fill, watch=self.tape.watch, min_entry=self.min_entry)
+        self.releases = releases.ReleaseScheduler(self.ledger, self.http, self.trade_release,
+                                                  lambda c, m: fetch_book(c, m), cfg=releases.settings(),
+                                                  quote_wait_s=self.quote_wait_s, verbose=verbose)
         self.processed = 0
         self.trades = 0
         self.shadow_trades = 0
+        self.starter_trades = 0
         self._tasks: list[asyncio.Task] = []
         self._bg: set[asyncio.Task] = set()
         self._shadow_tasks: set[asyncio.Task] = set()
+        self._starter_tasks: set[asyncio.Task] = set()
+        self._armed_style_noted = False
 
     @property
     def shadow_enabled(self) -> bool:
@@ -143,6 +189,17 @@ class Engine:
         self._tasks.append(asyncio.create_task(self._refresh_universe_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self._tasks.append(asyncio.create_task(self._backup_loop()))
+        stale = self.orders.withdraw_all("restart")   # a resting paper order never survives a restart
+        if stale and self.verbose:
+            print(f"paper orders: {stale} working order(s) from the previous session withdrawn")
+        self._spawn(self.orders.run())
+        rs = self.releases.cfg
+        if rs.enabled:
+            if not rs.bls_key:
+                print("releases: BLS_API_KEY not set, CPI and jobs releases are disabled (FOMC releases still run)")
+            self._spawn(self.releases.run())
+        else:
+            print("releases off (RELEASES_ENABLED=false)")
         if feeds:
             feed_tasks = self.hub.tasks()
             self._tasks += feed_tasks
@@ -167,6 +224,7 @@ class Engine:
         for t in pending:
             t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        self.orders.withdraw_all("engine_stop")
         # Each close is independent: one failing must not skip the others or the shutdown backup below.
         for name, closer in (("hub", self.hub.aclose), ("xfeed", self.xfeed.aclose), ("bsky", self.bsky.aclose),
                              ("jev", self.jev.aclose), ("http", self.http.aclose)):
@@ -272,6 +330,28 @@ class Engine:
                 self.queue.task_done()
 
     # ---------- the hot path ----------
+    async def _live_quotes(self, prefetch: dict[str, asyncio.Task], cands: list[dict]) -> tuple[dict[str, Book], float, int]:
+        """Wait at most self.quote_wait_s for the prefetched books. Books that landed (and did not raise) are returned by
+        market id and removed from `prefetch`; tasks still pending stay in `prefetch` untouched (not cancelled) for the
+        chosen-book step and the shadow/starter passes, and so do tasks that raised (their error is re-raised to whoever
+        awaits them, so a failing market costs one fetch, not two). A wait of 0 still collects tasks that already
+        finished. Returns (books, waited_ms, n_books)."""
+        pending = {t for t in prefetch.values() if not t.done()}
+        waited = 0.0
+        if pending:
+            t0 = time.perf_counter()
+            await asyncio.wait(pending, timeout=self.quote_wait_s)
+            waited = (time.perf_counter() - t0) * 1000
+        landed: dict[str, Book] = {}
+        for mid, task in list(prefetch.items()):
+            if not task.done():
+                continue
+            if task.cancelled() or task.exception() is not None:
+                continue            # keep it: awaiting it later raises, and counts as the one fetch for that market
+            landed[mid] = task.result()
+            del prefetch[mid]
+        return landed, waited, len(landed)
+
     async def handle(self, ev: dict) -> dict:
         self.ledger.event(ev)
         t0 = time.perf_counter()
@@ -319,7 +399,11 @@ class Engine:
             return self._finish(ev, rec)
 
         answers = res.get("answers", {})
-        d = decide(answers, keyed)
+        # Rank on LIVE books, not on the cache: the books were fetched while Jev thought, so they have usually landed.
+        live_books, rec["quote_wait_ms"], rec["n_live_quotes"] = await self._live_quotes(prefetch, cands)
+        quotes = {k: {"yes_ask": b.best("yes"), "yes_bid": b.bid("yes")} for k, m in keyed.items()
+                  if (b := live_books.get(m["id"])) is not None}
+        d = decide(answers, keyed, quotes=quotes)
         action, reason = d["action"], d["reason"]
         real_intent = d["action"]   # the real rule's own call, before any rewrite to PASS (no_book, unknown_market, ...)
         chosen = keyed.get(d.get("key"))
@@ -331,11 +415,13 @@ class Engine:
         if chosen:
             rec.update(venue=chosen["venue"], market_id=chosen["id"], market_question=chosen["question"])
             t2 = time.perf_counter()
-            task = prefetch.pop(chosen["id"], None) or self._spawn(fetch_book(self.http, chosen))
-            try:
-                book = await task
-            except Exception:
-                book = None
+            book = live_books.get(chosen["id"])
+            if book is None:
+                task = prefetch.pop(chosen["id"], None) or self._spawn(fetch_book(self.http, chosen))
+                try:
+                    book = await task
+                except Exception:
+                    book = None
             rec["book_ms"] = (time.perf_counter() - t2) * 1000  # ~0 when the prefetch already landed
             if book:
                 rec["mid_at_decision"] = book.mid()
@@ -353,45 +439,38 @@ class Engine:
         fill = None
         if action != "PASS" and book:
             side = "yes" if action == "BUY_YES" else "no"
-            blocked = (freshness_block(ev, rec.get("mid_at_published"), book.mid(), side)
-                       or cost_block(book, side, self.max_spread, self.cost_to_room_max, self.min_entry)
-                       or self._risk_block(chosen["id"], ev.get("synthetic", False)))
+            blocked, res_ = await self._execute(
+                "live", ev, chosen, side, book, self.max_trade, strength=d.get("strength"), decisive=d.get("p_decisive"),
+                mid_at_published=rec.get("mid_at_published"), style=self.styles["live"])
             if blocked:
                 rec["reason"] = blocked
                 if blocked in COST_BLOCK_REASONS:
                     action = rec["action"] = "PASS"   # market-property filters: no buy intent recorded
+            elif res_["style"] == "post":
+                rec["reason"] = "post_working"        # a resting paper order, not a fill: the trade appears when it fills
             else:
-                fill = simulate_fill(book, side, self.max_trade)
-                if fill:
-                    self.ledger.trade(event_id=ev["id"], opened_ts=time.time(), venue=chosen["venue"],
-                                      market_id=chosen["id"], market_question=chosen["question"], side=side,
-                                      contracts=fill["contracts"], avg_price=fill["avg_price"], cost=fill["cost"],
-                                      fee=fill["fee"], best_ask=fill["best_ask"],
-                                      synthetic=int(ev.get("synthetic", False)), shadow=0,
-                                      signal_strength=d.get("strength"), signal_decisive=d.get("p_decisive"))
-                    self.trades += 1
-                    rec["total_ms"] = (time.perf_counter() - t0) * 1000   # headline to paper fill, before the Kalshi round trip
-                    await self._real_order(ev, chosen, side, fill)
-                else:
-                    rec["reason"] = "no_fill_within_limit"
+                fill = res_
+                rec["total_ms"] = (time.perf_counter() - t0) * 1000   # headline to paper fill, before the Kalshi round trip
+                await self._real_order(ev, chosen, side, fill)
 
         rec.setdefault("total_ms", (time.perf_counter() - t0) * 1000)
         out = self._finish(ev, rec, fill)
         if chosen and book:
             self.ledger.mark(ev["id"], 0, book.best("yes"), book.bid("yes"), book.mid())
             self._spawn(self._marks(ev["id"], chosen))
-        # Prefetch tasks were started before the Jev call and have usually landed by the time Jev answers. The shadow
-        # pass starts strictly after the real decision row, fill and marks are recorded, and anything that may await a
-        # network book runs as a tracked background task, so a slow shadow fetch can never hold a worker.
-        handed_over = False
-        try:
-            handed_over = self._shadow(ev, rec, real_intent, answers, keyed, chosen, book, prefetch)
-        except Exception as exc:  # a shadow bug must never look like a real-path failure
-            print(f"shadow setup error (real decision already recorded) on {ev.get('headline', '')[:60]}: {exc!r}")
-            errors.capture(exc, "engine.shadow_setup")
-        if not handed_over:
-            for t in prefetch.values():
-                t.cancel()
+        # Prefetch tasks were started before the Jev call and have usually landed by the time Jev answers. The shadow and
+        # starter passes start strictly after the real decision row, fill and marks are recorded, and anything that may
+        # await a network book runs as a tracked background task, so a slow fetch can never hold a worker. They share the
+        # still-pending tasks through a pool; the last pass to finish cancels what is left.
+        pool = PrefetchPool(prefetch)
+        for name, setup in (("shadow", self._shadow), ("starter", self._starter)):
+            try:
+                setup(ev, rec, real_intent, answers, keyed, quotes, live_books, chosen, book, pool)
+            except Exception as exc:  # a side-book bug must never look like a real-path failure
+                print(f"{name} setup error (real decision already recorded) on {ev.get('headline', '')[:60]}: {exc!r}")
+                errors.capture(exc, f"engine.{name}_setup")
+        if pool.holders == 0:
+            pool.cancel_all()
         return out
 
     async def drain_shadow(self):
@@ -399,16 +478,21 @@ class Engine:
         while self._shadow_tasks:
             await asyncio.gather(*list(self._shadow_tasks), return_exceptions=True)
 
-    def _shadow(self, ev: dict, rec: dict, real_intent: str, answers: dict, keyed: dict, chosen: dict | None, book,
-                prefetch: dict) -> bool:
+    async def drain_starter(self):
+        """Wait for in-flight starter passes."""
+        while self._starter_tasks:
+            await asyncio.gather(*list(self._starter_tasks), return_exceptions=True)
+
+    def _shadow(self, ev: dict, rec: dict, real_intent: str, answers: dict, keyed: dict, quotes: dict, live_books: dict,
+                chosen: dict | None, book, pool: PrefetchPool) -> bool:
         """Record what the looser shadow rule would have done, in the shadow book. Never touches the real book.
 
         Runs on the same Jev answers (no extra call). Only when the real rule had no buy intent: if the real decide()
         returned a BUY (even one later rewritten to PASS: no_book, unknown_market, too_expensive) or the recorded action
         is not PASS, shadow records real_signalled and never trades. Paper only.
 
-        This part is synchronous. Returns True when the rest was handed to a background task (which then owns the
-        prefetch tasks and cancels them).
+        This part is synchronous. Returns True when the rest was handed to a background task (which then holds the
+        prefetch pool and releases it).
         """
         if not self.shadow_enabled or ev.get("synthetic"):
             return False
@@ -416,77 +500,240 @@ class Engine:
             rec.update(shadow_action=None, shadow_reason="real_signalled")
             self.ledger.shadow_decision(ev["id"], None, "real_signalled")
             return False
-        task = self._spawn(self._shadow_run(ev, rec, answers, keyed, chosen, book, prefetch))
+        pool.acquire()
+        task = self._spawn(self._shadow_run(ev, rec, answers, keyed, chosen, book, pool, quotes, live_books))
         self._shadow_tasks.add(task)
         task.add_done_callback(self._shadow_tasks.discard)
         return True
 
     async def _shadow_run(self, ev: dict, rec: dict, answers: dict, keyed: dict, chosen: dict | None, book,
-                          prefetch: dict):
+                          pool: PrefetchPool, quotes: dict | None = None, live_books: dict | None = None):
         try:
-            await self._shadow_decide(ev, rec, answers, keyed, chosen, book, prefetch)
+            await self._shadow_decide(ev, rec, answers, keyed, chosen, book, pool, quotes, live_books)
         except Exception as exc:
             print(f"shadow error (real decision already recorded) on {ev.get('headline', '')[:60]}: {exc!r}")
             errors.capture(exc, "engine.shadow")
         finally:
-            for t in prefetch.values():
-                t.cancel()
+            pool.release()
 
     async def _shadow_decide(self, ev: dict, rec: dict, answers: dict, keyed: dict, chosen: dict | None, book,
-                             prefetch: dict):
-        s_id = None
+                             pool: PrefetchPool, quotes: dict | None = None, live_books: dict | None = None):
+        def record(sa, sr, market_id):
+            rec.update(shadow_action=sa, shadow_reason=sr, shadow_market_id=market_id)
+            self.ledger.shadow_decision(ev["id"], sa, sr, market_id)
 
-        def record(sa, sr):
-            rec.update(shadow_action=sa, shadow_reason=sr, shadow_market_id=s_id)
-            self.ledger.shadow_decision(ev["id"], sa, sr, s_id)
+        await self._side_book("shadow", ev, rec, answers, keyed, quotes or {}, live_books or {}, chosen, book, pool,
+                              self.shadow_signal, self.shadow_decisive, self.max_trade, record)
 
-        ds = decide(answers, keyed, signal_threshold=self.shadow_signal, decisive_min=self.shadow_decisive)
+    def _starter(self, ev: dict, rec: dict, real_intent: str, answers: dict, keyed: dict, quotes: dict, live_books: dict,
+                 chosen: dict | None, book, pool: PrefetchPool) -> bool:
+        """The starter book: a small fixed-size paper book on a stricter-than-shadow rule (env STARTER_*). Same shape as
+        the shadow pass: only when the real rule had no buy intent, never on synthetic events, never a real order."""
+        if not self.starter_on or ev.get("synthetic"):
+            return False
+        if real_intent != "PASS" or rec["action"] != "PASS":
+            rec.update(starter_action=None, starter_reason="real_signalled")
+            self.ledger.starter_decision(ev["id"], None, "real_signalled")
+            return False
+        pool.acquire()
+        task = self._spawn(self._starter_run(ev, rec, answers, keyed, chosen, book, pool, quotes, live_books))
+        self._starter_tasks.add(task)
+        task.add_done_callback(self._starter_tasks.discard)
+        return True
+
+    async def _starter_run(self, ev: dict, rec: dict, answers: dict, keyed: dict, chosen: dict | None, book,
+                           pool: PrefetchPool, quotes: dict, live_books: dict):
+        try:
+            await self._starter_decide(ev, rec, answers, keyed, chosen, book, pool, quotes, live_books)
+        except Exception as exc:
+            print(f"starter error (real decision already recorded) on {ev.get('headline', '')[:60]}: {exc!r}")
+            errors.capture(exc, "engine.starter")
+        finally:
+            pool.release()
+
+    async def _starter_decide(self, ev: dict, rec: dict, answers: dict, keyed: dict, chosen: dict | None, book,
+                              pool: PrefetchPool, quotes: dict, live_books: dict):
+        def record(sa, sr, market_id):
+            rec.update(starter_action=sa, starter_reason=sr, starter_market_id=market_id)
+            self.ledger.starter_decision(ev["id"], sa, sr, market_id)
+
+        await self._side_book("starter", ev, rec, answers, keyed, quotes, live_books, chosen, book, pool,
+                              self.starter_signal, self.starter_decisive, self.starter_size, record)
+
+    async def _side_book(self, name: str, ev: dict, rec: dict, answers: dict, keyed: dict, quotes: dict, live_books: dict,
+                         chosen: dict | None, book, pool: PrefetchPool, sig: float, dec: float, size_usd: float, record):
+        """One side-book decision (shadow or starter): the real scoring and room ranking with its own thresholds on the
+        same live quotes, then the shared guards and entry in `_execute`. No bankroll or daily-halt check: these books
+        have no bankroll."""
+        ds = decide(answers, keyed, quotes=quotes, signal_threshold=sig, decisive_min=dec)
         sa, sr = ds["action"], ds["reason"]
         s_chosen = keyed.get(ds.get("key"))
         s_id = s_chosen["id"] if s_chosen else None
         if sa == "PASS":
-            return record("PASS", sr)
+            return record("PASS", sr, s_id)
         if not s_chosen:
-            return record("PASS", "unknown_market")
-        s_book = book if (chosen and book and s_id == chosen["id"]) else None
+            return record("PASS", "unknown_market", s_id)
+        s_book = book if (chosen and book and s_id == chosen["id"]) else live_books.get(s_id)
         if s_book is None:
             try:
-                task = prefetch.pop(s_id, None) or self._spawn(fetch_book(self.http, s_chosen))
+                task = pool.get(s_id) or self._spawn(fetch_book(self.http, s_chosen))
                 s_book = await task
             except Exception:
                 s_book = None
             if s_book is None:
-                return record("PASS", "no_book")
+                return record("PASS", "no_book", s_id)
         side = "yes" if sa == "BUY_YES" else "no"
-        if chosen and s_id == chosen["id"]:
+        same = bool(chosen and s_id == chosen["id"])
+        if same:
             mid_pub = rec.get("mid_at_published")
         else:
             mid_pub = self._tape_mid(s_id, ev.get("published_ts")) if s_chosen["venue"] == "kalshi" else None
-        blocked = (freshness_block(ev, mid_pub, s_book.mid(), side)
-                   or cost_block(s_book, side, self.max_spread, self.cost_to_room_max, self.min_entry)
-                   or ("already_in_market" if s_id in self.ledger.traded_markets(shadow=True) else None))
-        if blocked:  # no bankroll or daily-halt check: the shadow book has no bankroll
-            return record("PASS" if blocked in COST_BLOCK_REASONS else sa, blocked)
-        fill = simulate_fill(s_book, side, self.max_trade)
-        if not fill:
-            return record(sa, "no_fill_within_limit")
-        self.ledger.trade(event_id=ev["id"], opened_ts=time.time(), venue=s_chosen["venue"], market_id=s_id,
-                          market_question=s_chosen["question"], side=side, contracts=fill["contracts"],
-                          avg_price=fill["avg_price"], cost=fill["cost"], fee=fill["fee"], best_ask=fill["best_ask"],
-                          synthetic=0, shadow=1, signal_strength=ds.get("strength"),
-                          signal_decisive=ds.get("p_decisive"))
-        self.shadow_trades += 1
-        key = mark_key(ev["id"], True)
-        self.ledger.mark(key, 0, s_book.best("yes"), s_book.bid("yes"), s_book.mid())
-        self._spawn(self._marks(key, s_chosen))
-        if s_chosen["venue"] == "kalshi" and self.tape_enabled:
-            self.tape.track(s_id, since_ts=(ev.get("published_ts") or ev["seen_ts"]) - 120)
-        record(sa, sr)
+        blocked, res = await self._execute(name, ev, s_chosen, side, s_book, size_usd, strength=ds.get("strength"),
+                                           decisive=ds.get("p_decisive"), mid_at_published=mid_pub,
+                                           style=self.styles[name])
+        if blocked:
+            return record("PASS" if blocked in COST_BLOCK_REASONS else sa, blocked, s_id)
+        tail = ("" if same else "  (differs from the real decision's market)")
+        if res["style"] == "post":
+            record(sa, "post_working", s_id)
+            if self.verbose:
+                print(f"{'':16}** {name.upper()} ORDER RESTING {sa} {res['requested']:g} @ <= {res['limit_price']} "
+                      f"(take would be {res['take_price']}) signal {ds['strength']:.2f}\n"
+                      f"{'':16}   {name} market -> {s_chosen['venue']}: {s_chosen['question'][:90]}" + tail)
+            return
+        record(sa, sr, s_id)
         if self.verbose:
-            print(f"{'':16}** SHADOW FILL {sa} {fill['contracts']} @ {fill['avg_price']} cost ${fill['cost']} "
-                  f"fee ${fill['fee']} signal {ds['strength']:.2f} (looser rule, not a real paper trade)\n"
-                  f"{'':16}   shadow market -> {s_chosen['venue']}: {s_chosen['question'][:90]}"
-                  + ("" if chosen and s_id == chosen["id"] else "  (differs from the real decision's market)"))
+            what = "looser rule, not a real paper trade" if name == "shadow" else "starter book, not a real paper trade"
+            print(f"{'':16}** {name.upper()} FILL {sa} {res['contracts']} @ {res['avg_price']} cost ${res['cost']} "
+                  f"fee ${res['fee']} signal {ds['strength']:.2f} ({what})\n"
+                  f"{'':16}   {name} market -> {s_chosen['venue']}: {s_chosen['question'][:90]}" + tail)
+
+    # ---------- one entry path for every book ----------
+    def _book_risk_block(self, book_name: str, market: dict, synthetic: bool) -> str | None:
+        if book_name == "live":
+            return self._risk_block(market["id"], synthetic)
+        if book_name == "starter" and (is_sports_market(market) or market.get("category") == "Sports"):
+            return "sports_market"
+        if market["id"] in self.ledger.traded_markets(book_name):   # held, or a resting order on it
+            return "already_in_market"
+        return None
+
+    def _effective_style(self, book_name: str, market: dict, synthetic: bool, style: str) -> str:
+        """Synthetic events always take (a resting order in a one-minute test run would never fill). With real money armed
+        the LIVE book takes on Kalshi whatever the env says, so a resting paper order can never diverge from the
+        immediate-or-cancel order that would be sent."""
+        if synthetic:
+            return "take"
+        if book_name == "live" and market["venue"] == "kalshi" and self.live.is_live():
+            if style == "post" and not self._armed_style_noted:
+                self._armed_style_noted = True
+                print("real money armed: LIVE book uses take on Kalshi (mirrors the IOC order)")
+            return "take"
+        return style
+
+    async def _execute(self, book_name: str, ev: dict, market: dict, side: str, bk: Book, size_usd: float, *,
+                       strength: float | None, decisive: float | None, mid_at_published: float | None,
+                       style: str, source_tag: str | None = None) -> tuple[str | None, dict | None]:
+        """Guards in this order: freshness_block, cost_block, position/risk block for `book_name`, then either a take fill
+        (simulate_fill + ledger.trade + marks) or a resting paper order (self.orders.place). Returns
+        (blocked_reason, result); the result carries style "take" (a fill: contracts, avg_price, cost, fee, limit) or
+        "post" (the order row). Never sends a real order: the caller decides that, only for the LIVE book on a take fill.
+        There is no await between the guards and the ledger write, so concurrent events cannot double-enter a market."""
+        synthetic = bool(ev.get("synthetic"))
+        blocked = (freshness_block(ev, mid_at_published, bk.mid(), side)
+                   or cost_block(bk, side, self.max_spread, self.cost_to_room_max, self.min_entry)
+                   or self._book_risk_block(book_name, market, synthetic))
+        if blocked:
+            return blocked, None
+        style = self._effective_style(book_name, market, synthetic, style)
+        if style == "post":
+            if self.orders.full():
+                return "post_queue_full", None
+            if post_limit(bk, side, self.min_entry) is None:
+                bid = bk.bid(side)
+                return ("longshot" if bid is not None and bid + TICK < self.min_entry else "priced_in"), None
+            order = self.orders.place(book=book_name, ev=ev, market=market, side=side, bk=bk, size_usd=size_usd,
+                                      strength=strength, decisive=decisive, synthetic=synthetic)
+            if order is None:
+                return "no_fill_within_limit", None
+            return None, order
+        fill = simulate_fill(bk, side, size_usd)
+        if not fill:
+            return "no_fill_within_limit", None
+        self.ledger.trade(event_id=ev["id"], opened_ts=time.time(), venue=market["venue"], market_id=market["id"],
+                          market_question=market["question"], side=side, contracts=fill["contracts"],
+                          avg_price=fill["avg_price"], cost=fill["cost"], fee=fill["fee"], best_ask=fill["best_ask"],
+                          synthetic=int(synthetic), shadow=int(book_name == "shadow"), book=book_name,
+                          entry_style="take", limit_price=fill["limit"], signal_strength=strength, signal_decisive=decisive)
+        if book_name == "live":
+            self.trades += 1
+        else:
+            if book_name == "shadow":
+                self.shadow_trades += 1
+            else:
+                self.starter_trades += 1
+            key = mark_key(ev["id"], book_name)   # the LIVE book's marks are written by handle() for every decision
+            self.ledger.mark(key, 0, bk.best("yes"), bk.bid("yes"), bk.mid())
+            self._spawn(self._marks(key, market))
+            if market["venue"] == "kalshi" and self.tape_enabled:
+                self.tape.track(market["id"], since_ts=(ev.get("published_ts") or ev["seen_ts"]) - 120)
+        return None, {**fill, "style": "take"}
+
+    def _on_paper_fill(self, order: dict, trade_id: int, market: dict) -> None:
+        """A resting paper order just got its first fill (the trade row exists and so does the horizon-0 mark). Paper only:
+        schedule the price marks and count it. This never reaches the real-money path."""
+        book = order["book"]
+        if book == "live":
+            self.trades += 1       # the LIVE decision already scheduled its marks
+        else:
+            if book == "shadow":
+                self.shadow_trades += 1
+            else:
+                self.starter_trades += 1
+            self._spawn(self._marks(mark_key(order["event_id"], book), market))
+        if market.get("venue") == "kalshi" and self.tape_enabled:
+            self.tape.track(order["market_id"], since_ts=order["created_ts"] - 120)
+        if self.verbose:
+            print(f"{'':16}** POST FILL [{book}] {order['side'].upper()} {order['filled']:g} @ {order['limit_price']} "
+                  f"(take was {order['take_price']}): {(order.get('market_question') or '')[:80]}")
+
+    # ---------- scheduled data releases ----------
+    async def trade_release(self, ev: dict, market: dict, side: str, bk: Book, value, n_candidates: int = 1) -> dict:
+        """A number just came out and `market` settles on it: enter in the LIVE paper book (no Jev). Same sizing, same
+        guards, same entry style and the same route to a real order as any other LIVE trade (three locks, caps,
+        NO-side rule). Called by the release scheduler."""
+        self.ledger.event(ev)
+        rec = {"n_candidates": n_candidates, "shortlist_ms": 0.0, "venue": market["venue"], "market_id": market["id"],
+               "market_question": market["question"], "market_conf": 1.0, "materiality": 1.0,
+               "p_up": 1.0 if side == "yes" else 0.0, "p_down": 0.0 if side == "yes" else 1.0,
+               "action": "BUY_YES" if side == "yes" else "BUY_NO", "reason": f"release_{side}",
+               "answers": {"release": {"value": value, "source": ev["source"]}},
+               "mid_at_decision": bk.mid(), "mid_at_seen": self._tape_mid(market["id"], ev["seen_ts"]),
+               "mid_at_published": self._tape_mid(market["id"], ev.get("published_ts"))}
+        if self.tape_enabled:
+            self.tape.track(market["id"], since_ts=(ev.get("published_ts") or ev["seen_ts"]) - 120)
+        fill = None
+        blocked, res = await self._execute(
+            "live", ev, market, side, bk, self.max_trade, strength=1.0, decisive=1.0,
+            mid_at_published=rec["mid_at_published"], style=self.styles["live"], source_tag=ev["source"])
+        if blocked:
+            rec["reason"] = blocked
+            if blocked in COST_BLOCK_REASONS:
+                rec["action"] = "PASS"
+        elif res["style"] == "post":
+            rec["reason"] = "post_working"
+        else:
+            fill = res
+        rec["total_ms"] = max(0.0, (time.time() - (ev.get("published_ts") or ev["seen_ts"])) * 1000)   # T to fill
+        if fill:
+            if self.verbose:
+                print(f"{'':16}** RELEASE FILL {rec['action']} {fill['contracts']} @ {fill['avg_price']} "
+                      f"[{ev['source']}] {ev['headline'][:60]}")
+            await self._real_order(ev, market, side, fill)
+        out = self._finish(ev, rec, fill)
+        self.ledger.mark(ev["id"], 0, bk.best("yes"), bk.bid("yes"), bk.mid())
+        self._spawn(self._marks(ev["id"], market))
+        return out
 
     async def _real_order(self, ev: dict, market: dict, side: str, fill: dict):
         """The paper trade is already recorded. If the user switched to real for this session, send the same buy to
@@ -531,11 +778,11 @@ class Engine:
         return None
 
     def _today_pnl(self) -> float:
-        rows = self.ledger.db.execute("""
+        rows = self.ledger.db.execute(f"""
             SELECT t.side, t.contracts, t.cost, t.fee,
                    (SELECT yes_bid FROM marks m WHERE m.event_id = t.event_id ORDER BY horizon_s DESC LIMIT 1),
                    (SELECT yes_ask FROM marks m WHERE m.event_id = t.event_id ORDER BY horizon_s DESC LIMIT 1)
-            FROM trades t WHERE t.synthetic = 0 AND t.shadow = 0 AND t.opened_ts > ?""", (time.time() - 86400,)).fetchall()
+            FROM trades t WHERE t.synthetic = 0 AND {BOOK_SQL} = 'live' AND t.opened_ts > ?""", (time.time() - 86400,)).fetchall()
         pnl = 0.0
         for side, n, cost, fee, yb, ya in rows:
             exit_px = yb if side == "yes" else (1 - ya if ya is not None else None)
@@ -561,7 +808,7 @@ class Engine:
             lag_s = f"{lag:7.0f}s" if lag is not None else "      ?"
             tag = "SYN " if ev.get("synthetic") else ""
             line = (f"{tag}[{ev['source'][:20]:20}] src-lag {lag_s} | match {rec['shortlist_ms']:5.1f}ms "
-                    f"jev {_fmt_ms(rec.get('jev_ms'))} book-wait {_fmt_ms(rec.get('book_ms'))} "
+                    f"jev {_fmt_ms(rec.get('jev_ms'))} quotes {_quotes_cell(rec)} book-wait {_fmt_ms(rec.get('book_ms'))} "
                     f"total {_fmt_ms(rec.get('total_ms'))} | {rec['action']:7} {rec['reason']:20} | {ev['headline'][:70]}")
             print(line)
             if rec.get("market_question"):
@@ -592,5 +839,5 @@ class Engine:
             errors.message(f"feed not answering: {name}", "feeds.dead")
         mode = "REAL" if self.live.is_live() else "paper"
         return (f"[status] mode {mode} | polls {polls} | new items {new} | decided {self.processed} | paper trades {self.trades} | shadow {self.shadow_trades} "
-                f"| real orders {self.live_orders} | queue {self.queue.qsize()} | {tape} | {x} | {b} "
+                f"| starter {self.starter_trades} | working {len(self.orders.working())} | real orders {self.live_orders} | queue {self.queue.qsize()} | {tape} | {x} | {b} "
                 f"| shadow mode {'on' if self.shadow_enabled else 'off'}" + (f" | dead feeds: {', '.join(bad)}" if bad else ""))

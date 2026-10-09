@@ -1,0 +1,141 @@
+{
+ "fetched_ts": 1791577342,
+ "source": "https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=KXU3&with_nested_markets=true&status=open&limit=20",
+ "markets": [
+  {
+   "ticker": "KXU3-26OCT-T3.7",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 3.7% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 3.7,
+   "cap_strike": null,
+   "yes_sub_title": "Above 3.7%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T3.8",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 3.8% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 3.8,
+   "cap_strike": null,
+   "yes_sub_title": "Above 3.8%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T3.9",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 3.9% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 3.9,
+   "cap_strike": null,
+   "yes_sub_title": "Above 3.9%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.0",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.0% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.0%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.1",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.1% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.1,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.1%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.2",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.2% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.2,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.2%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.3",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.3% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.3,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.3%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.4",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.4% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.4,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.4%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.5",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.5% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.5,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.5%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.6",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.6% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.6,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.6%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.7",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.7% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.7,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.7%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.8",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.8% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.8,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.8%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T4.9",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 4.9% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 4.9,
+   "cap_strike": null,
+   "yes_sub_title": "Above 4.9%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26OCT-T5.0",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 5.0% in October 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 5,
+   "cap_strike": null,
+   "yes_sub_title": "Above 5.0%",
+   "close_time": "2026-11-06T13:29:00Z"
+  },
+  {
+   "ticker": "KXU3-26NOV-T3.7",
+   "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics in the Employment Situation Report is above 3.7% in November 2026, then the market resolves to Yes.",
+   "strike_type": "greater",
+   "floor_strike": 3.7,
+   "cap_strike": null,
+   "yes_sub_title": "Above 3.7%",
+   "close_time": "2026-12-04T13:29:00Z"
+  }
+ ]
+}

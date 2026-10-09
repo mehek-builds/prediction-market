@@ -201,3 +201,122 @@ def test_strength_bucket():
     assert [decision.strength_bucket(s) for s in (.59, .60, .69, .70, .84, .85, 1.0)] == \
         ["<0.60", "0.60-0.70", "0.60-0.70", "0.70-0.85", "0.70-0.85", "0.85+", "0.85+"]
     assert decision.strength_bucket(None) is None
+
+
+# ---------- v0.5.0: live quotes in selection ----------
+def _lq(ask, bid):
+    return {"yes_ask": ask, "yes_bid": bid}
+
+
+@pytest.mark.parametrize("answers,keyed", PARITY_CASES)
+def test_quotes_none_and_empty_are_parity(answers, keyed):
+    base = decide(answers, keyed)
+    assert decide(answers, keyed, quotes=None) == base
+    assert decide(answers, keyed, quotes={}) == base
+
+
+@pytest.mark.parametrize("case,expected", list(zip(PARITY_CASES, PARITY_EXPECTED)))
+def test_live_quotes_equal_to_cache_keep_every_prior_branch(case, expected):
+    answers, keyed = case
+    quotes = {k: dict(v) for k, v in (keyed or {}).items()}
+    r = decide(answers, keyed, quotes=quotes)
+    if expected is None:
+        assert r["action"] == "PASS"
+    else:
+        assert (r["action"], r["reason"]) == expected
+
+
+def test_live_quote_overrides_cache_to_priced_in():
+    r = decide({"m0": ans(**GOOD)}, {"m0": _lq(.40, .38)}, quotes={"m0": _lq(.97, .96)})
+    assert (r["action"], r["reason"]) == ("PASS", "priced_in") and r["quote_source"] == "live"
+
+
+def test_live_quote_overrides_cache_to_buy():
+    r = decide({"m0": ans(**GOOD)}, {"m0": _lq(.97, .96)}, quotes={"m0": _lq(.40, .38)})
+    assert r["action"] == "BUY_YES" and r["quote_source"] == "live" and r["entry"] == pytest.approx(.40)
+
+
+def test_cache_quote_source_and_entry():
+    r = decide({"m0": ans(**GOOD)}, {"m0": _lq(.40, .38)})
+    assert r["quote_source"] == "cache" and r["entry"] == pytest.approx(.40)
+    r = decide({"m0": ans(**GOOD)})
+    assert r["quote_source"] == "none" and r["entry"] is None
+
+
+def test_live_quotes_reorder_two_qualifiers():
+    keyed = {"A": _lq(.30, .28), "B": _lq(.80, .78)}
+    assert decide({"A": ans(**GOOD), "B": ans(**GOOD)}, keyed)["key"] == "A"
+    r = decide({"A": ans(**GOOD), "B": ans(**GOOD)}, keyed, quotes={"A": _lq(.995, .99), "B": _lq(.60, .58)})
+    assert r["key"] == "B" and r["action"] == "BUY_YES"
+
+
+def test_missing_key_in_quotes_falls_back_to_cache():
+    keyed = {"A": _lq(.30, .28), "B": _lq(.80, .78)}
+    r = decide({"A": ans(**GOOD), "B": ans(**GOOD)}, keyed, quotes={"B": _lq(.10, .08)})
+    assert r["key"] == "B" and r["entry"] == pytest.approx(.10)
+    r = decide({"A": ans(**GOOD), "B": ans(**GOOD)}, keyed, quotes={"B": _lq(.99, .98)})
+    assert r["key"] == "A" and r["quote_source"] == "cache"
+
+
+def test_no_side_uses_live_yes_bid():
+    a = {"m0": ans(decisive_no=.6, toward_no=.3, no_signal=.1)}
+    r = decide(a, {"m0": _lq(.60, .58)}, quotes={"m0": _lq(.04, .02)})
+    assert (r["action"], r["reason"], r["side"]) == ("PASS", "priced_in", "no")
+    assert r["entry"] == pytest.approx(.98)
+    r = decide(a, {"m0": _lq(.04, .02)}, quotes={"m0": _lq(.60, .58)})
+    assert r["action"] == "BUY_NO" and r["entry"] == pytest.approx(.42)
+
+
+def test_live_book_without_ask_is_room_zero_pass_no_fill():
+    r = decide({"m0": ans(**GOOD)}, {"m0": _lq(.40, .38)}, quotes={"m0": _lq(None, .38)})
+    assert (r["action"], r["reason"]) == ("PASS", "no_fill_within_limit")
+    assert r["room"] == 0.0 and r["no_ask"] is True and r["entry"] is None
+
+
+def test_live_no_bid_blocks_no_side_entry():
+    a = {"m0": ans(decisive_no=.6, toward_no=.3, no_signal=.1)}
+    for bid in (None, 0):
+        r = decide(a, {"m0": _lq(.40, .38)}, quotes={"m0": _lq(.40, bid)})
+        assert (r["action"], r["reason"]) == ("PASS", "no_fill_within_limit")
+
+
+def test_no_ask_candidate_loses_to_roomy_qualifier():
+    r = decide({"m0": ans(**STRONGER), "m1": ans(**GOOD)}, {},
+               quotes={"m0": _lq(None, None), "m1": _lq(.50, .48)})
+    assert r["key"] == "m1" and r["action"] == "BUY_YES"
+
+
+def test_no_ask_vs_priced_in_picks_strongest_reason():
+    r = decide({"m0": ans(**GOOD), "m1": ans(**STRONGER)}, {},
+               quotes={"m0": _lq(.97, .96), "m1": _lq(None, None)})
+    assert r["key"] == "m1" and r["reason"] == "no_fill_within_limit"
+    r = decide({"m0": ans(**STRONGER), "m1": ans(**GOOD)}, {},
+               quotes={"m0": _lq(.97, .96), "m1": _lq(None, None)})
+    assert r["key"] == "m0" and r["reason"] == "priced_in"
+
+
+def test_starter_settings_defaults_and_env(monkeypatch):
+    assert decision.starter_settings() == (True, .90, 0.0, 20.0)
+    monkeypatch.setenv("STARTER_ENABLED", "false"); monkeypatch.setenv("STARTER_SIGNAL_THRESHOLD", "0.8")
+    monkeypatch.setenv("STARTER_DECISIVE_MIN", "0.1"); monkeypatch.setenv("STARTER_SIZE_USD", "35")
+    assert decision.starter_settings() == (False, .8, .1, 35.0)
+    monkeypatch.setenv("STARTER_SIZE_USD", "")
+    assert decision.starter_settings()[3] == 20.0
+
+
+def test_entry_styles_defaults_and_overrides(monkeypatch):
+    assert decision.entry_styles() == {"live": "take", "shadow": "post", "starter": "post"}
+    monkeypatch.setenv("ENTRY_STYLE", " POST ")
+    assert decision.entry_styles() == {"live": "post", "shadow": "post", "starter": "post"}
+    monkeypatch.setenv("ENTRY_STYLE", "take")
+    monkeypatch.setenv("ENTRY_STYLE_SHADOW", "Post")
+    assert decision.entry_styles() == {"live": "take", "shadow": "post", "starter": "take"}
+    monkeypatch.setenv("ENTRY_STYLE_STARTER", "")
+    assert decision.entry_styles()["starter"] == "take"   # empty means unset
+
+
+@pytest.mark.parametrize("name", ["ENTRY_STYLE_LIVE", "ENTRY_STYLE_SHADOW", "ENTRY_STYLE_STARTER", "ENTRY_STYLE"])
+def test_entry_styles_rejects_unknown(monkeypatch, name):
+    monkeypatch.setenv(name, "limit")
+    with pytest.raises(ValueError):
+        decision.entry_styles()

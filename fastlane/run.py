@@ -60,6 +60,8 @@ if __name__ == "__main__":
     args = ap.parse_args()
     if not os.environ.get("OPENROUTER_API_KEY", "").strip():
         sys.exit("OPENROUTER_API_KEY is not set. Copy .env.example to .env and fill it in.")
+    from fastlane import releases
+    from fastlane.decision import entry_styles, starter_settings
     from fastlane.kalshi_tape import move_deny_re
     from fastlane.bluesky import bsky_settings
     from fastlane.x_feed import x_settings
@@ -67,6 +69,10 @@ if __name__ == "__main__":
         x_settings()        # XAI_* validation (None when the key is unset: feature off)
         bsky_settings()     # BSKY_* validation
         move_deny_re()      # MOVE_DENY_RE must compile
+        entry_styles()      # ENTRY_STYLE / ENTRY_STYLE_* must be take or post
+        starter_settings()  # STARTER_* numbers
+        releases.settings() # RELEASE_* numbers
+        releases.load_calendar()   # every calendar entry valid (a bad one names its index)
     except ValueError as exc:
         sys.exit(str(exc))
     errors.init("engine")

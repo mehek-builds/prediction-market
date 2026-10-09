@@ -210,6 +210,7 @@ def test_conflict_is_a_duplicate_not_a_second_order(tmp_path, rsa_pem, monkeypat
 # ---------- engine integration ----------
 def _engine(monkeypatch, tmp_path, tiny_universe, rsa_pem, recorder, enabled=True):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    monkeypatch.setenv("ENTRY_STYLE_SHADOW", "take")   # 0.5.0: shadow rests a bid by default; these tests need its fill row
     if enabled:
         monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
     monkeypatch.setattr(engine_mod, "Ledger", lambda: Ledger(tmp_path / "ledger.db"))
@@ -527,9 +528,10 @@ def test_engine_sends_a_no_order_when_opted_in(monkeypatch, tmp_path, tiny_unive
 def test_priced_in_never_reaches_the_live_path(monkeypatch, tmp_path, tiny_universe, rsa_pem):
     rec = Recorder(FILLED)
     e = _engine(monkeypatch, tmp_path, tiny_universe, rsa_pem, rec)
-    for m in e.universe.markets:
-        if m["id"] == "AVNT-1":
-            m["yes_ask"], m["yes_bid"] = .97, .96
+
+    async def priced_in_book(client, market):   # 0.5.0: room is read from the live book, not the cache
+        return Book("kalshi", market["id"], [(.97, 1000)], [(.04, 1000)])
+    monkeypatch.setattr(engine_mod, "fetch_book", priced_in_book)
     live.arm(e.live.session)
     out = _handle(e, _event())
     assert out["reason"] == "priced_in" and rec.requests == [] and _orders(e) == 0
