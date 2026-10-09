@@ -109,7 +109,8 @@ def test_gitignore_entries():
 def test_env_example_has_no_values_and_all_vars():
     text = (ROOT / ".env.example").read_text()
     for var in ["OPENROUTER_API_KEY", "JEV_MODEL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "SEC_USER_AGENT",
-                "PAPER_BANKROLL_USD", "PAPER_MAX_TRADE_PCT", "PAPER_DAILY_LOSS_HALT_PCT"]:
+                "PAPER_BANKROLL_USD", "PAPER_MAX_TRADE_PCT", "PAPER_DAILY_LOSS_HALT_PCT",
+                "SHADOW_ENABLED", "SHADOW_SIGNAL_THRESHOLD", "SHADOW_DECISIVE_MIN", "MAX_SPREAD_CENTS", "COST_TO_ROOM_MAX"]:
         assert re.search(rf"^{var}=", text, re.M), var
     for gone in ["KALSHI_ENV", "X_BEARER_TOKEN", "X_LIST_ID"]:
         assert gone not in text

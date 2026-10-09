@@ -8,13 +8,13 @@ import time
 
 import httpx
 
-from fastlane.books import fetch_book, simulate_fill
-from fastlane.decision import build_request, decide
+from fastlane.books import cost_block, fetch_book, simulate_fill
+from fastlane.decision import build_request, cost_settings, decide, shadow_settings
 from fastlane.feeds import FeedHub
 from fastlane.jev_client import JevClient
 from fastlane.kalshi import KalshiClient
 from fastlane.kalshi_tape import KalshiTape
-from fastlane.ledger import Ledger
+from fastlane.ledger import Ledger, mark_key
 from fastlane.universe import Universe
 
 MARK_HORIZONS_S = [5, 30, 60, 300, 900, 3600]
@@ -51,6 +51,8 @@ class Engine:
         self.bankroll = float(os.environ.get("PAPER_BANKROLL_USD", 10000))
         self.max_trade = self.bankroll * float(os.environ.get("PAPER_MAX_TRADE_PCT", 0.02))
         self.halt_loss = self.bankroll * float(os.environ.get("PAPER_DAILY_LOSS_HALT_PCT", 0.05))
+        self.shadow_enabled, self.shadow_signal, self.shadow_decisive = shadow_settings()
+        self.max_spread, self.cost_to_room_max = cost_settings()
         self.workers = workers
         self.verbose = verbose
         self.queue: asyncio.Queue = asyncio.Queue()
@@ -70,8 +72,10 @@ class Engine:
                                sign_headers=self.kalshi.sign_headers if self.tape_enabled else None)
         self.processed = 0
         self.trades = 0
+        self.shadow_trades = 0
         self._tasks: list[asyncio.Task] = []
         self._bg: set[asyncio.Task] = set()
+        self._shadow_tasks: set[asyncio.Task] = set()
 
     # ---------- lifecycle ----------
     async def start(self, feeds: bool = True):
@@ -209,6 +213,7 @@ class Engine:
         answers = res.get("answers", {})
         d = decide(answers, keyed)
         action, reason = d["action"], d["reason"]
+        real_intent = d["action"]   # the real rule's own call, before any rewrite to PASS (no_book, unknown_market, ...)
         chosen = keyed.get(d.get("key"))
         rec.update(action=action, reason=reason, answers=answers, jev_cost=(res.get("usage") or {}).get("cost"),
                    market_conf=d.get("strength"), p_up=d.get("p_yes_side"), p_down=d.get("p_no_side"),
@@ -231,8 +236,6 @@ class Engine:
                 rec["mid_at_seen"] = self._tape_mid(chosen["id"], ev["seen_ts"])
                 if self.tape_enabled:
                     self.tape.track(chosen["id"], since_ts=(ev.get("published_ts") or ev["seen_ts"]) - 120)
-        for t in prefetch.values():
-            t.cancel()
 
         if action != "PASS" and not chosen:  # a buy that cannot happen must not read as a buy
             action, rec["action"], rec["reason"] = "PASS", "PASS", "unknown_market"
@@ -242,9 +245,13 @@ class Engine:
         fill = None
         if action != "PASS" and book:
             side = "yes" if action == "BUY_YES" else "no"
-            blocked = freshness_block(ev, rec.get("mid_at_published"), book.mid(), side) or self._risk_block(chosen["id"], ev.get("synthetic", False))
+            blocked = (freshness_block(ev, rec.get("mid_at_published"), book.mid(), side)
+                       or cost_block(book, side, self.max_spread, self.cost_to_room_max)
+                       or self._risk_block(chosen["id"], ev.get("synthetic", False)))
             if blocked:
                 rec["reason"] = blocked
+                if blocked == "too_expensive":
+                    action = rec["action"] = "PASS"   # cost filter: no buy intent recorded
             else:
                 fill = simulate_fill(book, side, self.max_trade)
                 if fill:
@@ -252,7 +259,8 @@ class Engine:
                                       market_id=chosen["id"], market_question=chosen["question"], side=side,
                                       contracts=fill["contracts"], avg_price=fill["avg_price"], cost=fill["cost"],
                                       fee=fill["fee"], best_ask=fill["best_ask"],
-                                      synthetic=int(ev.get("synthetic", False)))
+                                      synthetic=int(ev.get("synthetic", False)), shadow=0,
+                                      signal_strength=d.get("strength"), signal_decisive=d.get("p_decisive"))
                     self.trades += 1
                 else:
                     rec["reason"] = "no_fill_within_limit"
@@ -262,7 +270,109 @@ class Engine:
         if chosen and book:
             self.ledger.mark(ev["id"], 0, book.best("yes"), book.bid("yes"), book.mid())
             self._spawn(self._marks(ev["id"], chosen))
+        # Prefetch tasks were started before the Jev call and have usually landed by the time Jev answers. The shadow
+        # pass starts strictly after the real decision row, fill and marks are recorded, and anything that may await a
+        # network book runs as a tracked background task, so a slow shadow fetch can never hold a worker.
+        handed_over = False
+        try:
+            handed_over = self._shadow(ev, rec, real_intent, answers, keyed, chosen, book, prefetch)
+        except Exception as exc:  # a shadow bug must never look like a real-path failure
+            print(f"shadow setup error (real decision already recorded) on {ev.get('headline', '')[:60]}: {exc!r}")
+        if not handed_over:
+            for t in prefetch.values():
+                t.cancel()
         return out
+
+    async def drain_shadow(self):
+        """Wait for in-flight shadow passes (tests and orderly shutdown helpers)."""
+        while self._shadow_tasks:
+            await asyncio.gather(*list(self._shadow_tasks), return_exceptions=True)
+
+    def _shadow(self, ev: dict, rec: dict, real_intent: str, answers: dict, keyed: dict, chosen: dict | None, book,
+                prefetch: dict) -> bool:
+        """Record what the looser shadow rule would have done, in the shadow book. Never touches the real book.
+
+        Runs on the same Jev answers (no extra call). Only when the real rule had no buy intent: if the real decide()
+        returned a BUY (even one later rewritten to PASS: no_book, unknown_market, too_expensive) or the recorded action
+        is not PASS, shadow records real_signalled and never trades. Paper only.
+
+        This part is synchronous. Returns True when the rest was handed to a background task (which then owns the
+        prefetch tasks and cancels them).
+        """
+        if not self.shadow_enabled or ev.get("synthetic"):
+            return False
+        if real_intent != "PASS" or rec["action"] != "PASS":
+            rec.update(shadow_action=None, shadow_reason="real_signalled")
+            self.ledger.shadow_decision(ev["id"], None, "real_signalled")
+            return False
+        task = self._spawn(self._shadow_run(ev, rec, answers, keyed, chosen, book, prefetch))
+        self._shadow_tasks.add(task)
+        task.add_done_callback(self._shadow_tasks.discard)
+        return True
+
+    async def _shadow_run(self, ev: dict, rec: dict, answers: dict, keyed: dict, chosen: dict | None, book,
+                          prefetch: dict):
+        try:
+            await self._shadow_decide(ev, rec, answers, keyed, chosen, book, prefetch)
+        except Exception as exc:
+            print(f"shadow error (real decision already recorded) on {ev.get('headline', '')[:60]}: {exc!r}")
+        finally:
+            for t in prefetch.values():
+                t.cancel()
+
+    async def _shadow_decide(self, ev: dict, rec: dict, answers: dict, keyed: dict, chosen: dict | None, book,
+                             prefetch: dict):
+        s_id = None
+
+        def record(sa, sr):
+            rec.update(shadow_action=sa, shadow_reason=sr, shadow_market_id=s_id)
+            self.ledger.shadow_decision(ev["id"], sa, sr, s_id)
+
+        ds = decide(answers, keyed, signal_threshold=self.shadow_signal, decisive_min=self.shadow_decisive)
+        sa, sr = ds["action"], ds["reason"]
+        s_chosen = keyed.get(ds.get("key"))
+        s_id = s_chosen["id"] if s_chosen else None
+        if sa == "PASS":
+            return record("PASS", sr)
+        if not s_chosen:
+            return record("PASS", "unknown_market")
+        s_book = book if (chosen and book and s_id == chosen["id"]) else None
+        if s_book is None:
+            try:
+                task = prefetch.pop(s_id, None) or self._spawn(fetch_book(self.http, s_chosen))
+                s_book = await task
+            except Exception:
+                s_book = None
+            if s_book is None:
+                return record("PASS", "no_book")
+        side = "yes" if sa == "BUY_YES" else "no"
+        if chosen and s_id == chosen["id"]:
+            mid_pub = rec.get("mid_at_published")
+        else:
+            mid_pub = self._tape_mid(s_id, ev.get("published_ts")) if s_chosen["venue"] == "kalshi" else None
+        blocked = (freshness_block(ev, mid_pub, s_book.mid(), side)
+                   or cost_block(s_book, side, self.max_spread, self.cost_to_room_max)
+                   or ("already_in_market" if s_id in self.ledger.traded_markets(shadow=True) else None))
+        if blocked:  # no bankroll or daily-halt check: the shadow book has no bankroll
+            return record("PASS" if blocked == "too_expensive" else sa, blocked)
+        fill = simulate_fill(s_book, side, self.max_trade)
+        if not fill:
+            return record(sa, "no_fill_within_limit")
+        self.ledger.trade(event_id=ev["id"], opened_ts=time.time(), venue=s_chosen["venue"], market_id=s_id,
+                          market_question=s_chosen["question"], side=side, contracts=fill["contracts"],
+                          avg_price=fill["avg_price"], cost=fill["cost"], fee=fill["fee"], best_ask=fill["best_ask"],
+                          synthetic=0, shadow=1, signal_strength=ds.get("strength"),
+                          signal_decisive=ds.get("p_decisive"))
+        self.shadow_trades += 1
+        key = mark_key(ev["id"], True)
+        self.ledger.mark(key, 0, s_book.best("yes"), s_book.bid("yes"), s_book.mid())
+        self._spawn(self._marks(key, s_chosen))
+        if s_chosen["venue"] == "kalshi" and self.tape_enabled:
+            self.tape.track(s_id, since_ts=(ev.get("published_ts") or ev["seen_ts"]) - 120)
+        record(sa, sr)
+        if self.verbose:
+            print(f"{'':16}** SHADOW FILL {sa} {fill['contracts']} @ {fill['avg_price']} cost ${fill['cost']} "
+                  f"fee ${fill['fee']} signal {ds['strength']:.2f} (looser rule, not a real paper trade)")
 
     def _spawn(self, coro) -> asyncio.Task:
         """Run a background coroutine, tracked so stop() can cancel it."""
@@ -287,7 +397,7 @@ class Engine:
             SELECT t.side, t.contracts, t.cost, t.fee,
                    (SELECT yes_bid FROM marks m WHERE m.event_id = t.event_id ORDER BY horizon_s DESC LIMIT 1),
                    (SELECT yes_ask FROM marks m WHERE m.event_id = t.event_id ORDER BY horizon_s DESC LIMIT 1)
-            FROM trades t WHERE t.synthetic = 0 AND t.opened_ts > ?""", (time.time() - 86400,)).fetchall()
+            FROM trades t WHERE t.synthetic = 0 AND t.shadow = 0 AND t.opened_ts > ?""", (time.time() - 86400,)).fetchall()
         pnl = 0.0
         for side, n, cost, fee, yb, ya in rows:
             exit_px = yb if side == "yes" else (1 - ya if ya is not None else None)
@@ -333,5 +443,5 @@ class Engine:
             tape = f"tape {'up' if self.tape.connected else 'DOWN'} {self.tape.msgs:,} quotes, {self.tape.moves} moves"
         else:
             tape = "tape off (no Kalshi key)"
-        return (f"[status] polls {polls} | new items {new} | decided {self.processed} | paper trades {self.trades} "
+        return (f"[status] polls {polls} | new items {new} | decided {self.processed} | paper trades {self.trades} | shadow {self.shadow_trades} "
                 f"| queue {self.queue.qsize()} | {tape}" + (f" | dead feeds: {', '.join(bad)}" if bad else ""))

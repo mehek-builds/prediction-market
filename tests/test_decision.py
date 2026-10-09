@@ -119,3 +119,83 @@ def test_unknown_price_still_qualifies():
 def test_weak_signal_with_no_room_stays_weak_signal():
     r = decide({"m0": ans(decisive_yes=.4, toward_yes=.1, no_signal=.5)}, {"m0": {"yes_ask": .97, "yes_bid": .96}})
     assert (r["action"], r["reason"]) == ("PASS", "weak_signal")
+
+
+LEAN = dict(toward_yes=.9, decisive_yes=.1)                     # strength 1.0, decisive .1: real lean_not_decisive
+MID = dict(decisive_yes=.4, toward_yes=.4, no_signal=.2)        # strength .8: real weak_signal, shadow trades
+LOW = dict(decisive_yes=.3, toward_yes=.35, no_signal=.35)      # strength .65: shadow trades (default .60), real passes
+TOOLOW = dict(decisive_yes=.2, toward_yes=.3, no_signal=.5)     # strength .5: both pass
+Q = {"m0": {"yes_ask": .4, "yes_bid": .38}}
+PARITY_CASES = [  # (answers, keyed): every branch of the real rule
+    ({"m0": ans(**GOOD)}, Q), ({"m0": ans(decisive_no=.6, toward_no=.3, no_signal=.1)}, Q),
+    ({"m0": ans(**LEAN)}, Q), ({"m0": ans(**MID)}, Q), ({"m0": ans(**LOW)}, Q), ({"m0": ans(no_signal=1.0)}, Q), ({}, None),
+    ({"m0": ans(**GOOD)}, {"m0": {"yes_ask": .97, "yes_bid": .96}}),
+    ({"m0": ans(**STRONGER), "m1": ans(**GOOD)}, {"m0": {"yes_ask": .97, "yes_bid": .96}, "m1": {"yes_ask": .4, "yes_bid": .38}}),
+    ({"m0": ans(**GOOD), "m1": ans(**GOOD)}, {"m0": {"yes_ask": .8, "yes_bid": .78}, "m1": {"yes_ask": .4, "yes_bid": .38}}),
+    ({"m0": ans(**GOOD)}, {"m0": {"yes_ask": .95, "yes_bid": .94}}), ({"m0": ans(**GOOD)}, None),
+]
+# Pinned (action, reason) per case so parity is against known real-rule behavior, not only self-consistency.
+PARITY_EXPECTED = [
+    ("BUY_YES", "signal_yes"), ("BUY_NO", "signal_no"), ("PASS", "lean_not_decisive"), ("PASS", "weak_signal"),
+    ("PASS", "weak_signal"), ("PASS", "irrelevant"), None,
+    ("PASS", "priced_in"), ("BUY_YES", "signal_yes"), ("BUY_YES", "signal_yes"), ("PASS", "priced_in"),
+    ("BUY_YES", "signal_yes"),
+]
+
+
+def test_real_rule_constants_unchanged():
+    assert (decision.SIGNAL_THRESHOLD, decision.DECISIVE_MIN, decision.MARK_THRESHOLD) == (.85, .30, .30)
+    assert (decision.SHADOW_SIGNAL_THRESHOLD, decision.SHADOW_DECISIVE_MIN, decision.SHADOW_ENABLED) == (.60, 0.0, True)
+    assert decision.BUCKET_EDGES == (.60, .70, .85)
+
+
+@pytest.mark.parametrize("answers,keyed", PARITY_CASES)
+def test_real_rule_parity_with_explicit_thresholds(answers, keyed):
+    assert decide(answers, keyed) == decide(answers, keyed, signal_threshold=.85, decisive_min=.30)
+
+
+@pytest.mark.parametrize("case,expected", list(zip(PARITY_CASES, PARITY_EXPECTED)))
+def test_real_rule_pinned_outcomes(case, expected):
+    r = decide(*case)
+    if expected is None:
+        assert r["action"] == "PASS" and r["reason"] in ("no_answers", "no_candidates")
+    else:
+        assert (r["action"], r["reason"]) == expected
+
+
+def test_shadow_trades_where_real_passes():
+    r = decide({"m0": ans(**LEAN)}, Q)
+    s = decide({"m0": ans(**LEAN)}, Q, signal_threshold=.60, decisive_min=0.0)
+    assert (r["action"], r["reason"]) == ("PASS", "lean_not_decisive")
+    assert (s["action"], s["reason"], s["key"]) == ("BUY_YES", "signal_yes", "m0")
+    for probs in (MID, LOW):
+        assert decide({"m0": ans(**probs)}, Q)["action"] == "PASS"
+        assert decide({"m0": ans(**probs)}, Q, signal_threshold=.60, decisive_min=0.0)["action"] == "BUY_YES"
+    assert decide({"m0": ans(**TOOLOW)}, Q, signal_threshold=.60, decisive_min=0.0)["reason"] == "weak_signal"
+
+
+def test_shadow_keeps_room_rule_and_fallbacks():
+    s = decide({"m0": ans(**LEAN)}, {"m0": {"yes_ask": .97, "yes_bid": .96}}, signal_threshold=.60, decisive_min=0.0)
+    assert (s["action"], s["reason"]) == ("PASS", "priced_in")
+    s = decide({"m0": ans(**LEAN), "m1": ans(**MID)},
+               {"m0": {"yes_ask": .8, "yes_bid": .78}, "m1": {"yes_ask": .4, "yes_bid": .38}},
+               signal_threshold=.60, decisive_min=0.0)
+    assert s["key"] == "m1"  # most room wins, as in the real rule
+    assert decide({"m0": ans(no_signal=1.0)}, Q, signal_threshold=.60, decisive_min=0.0)["reason"] == "irrelevant"
+
+
+def test_settings_from_env(monkeypatch):
+    assert decision.shadow_settings() == (True, .60, 0.0)
+    assert decision.cost_settings() == (.03, .25)
+    monkeypatch.setenv("SHADOW_ENABLED", "false"); monkeypatch.setenv("SHADOW_SIGNAL_THRESHOLD", "0.8")
+    monkeypatch.setenv("SHADOW_DECISIVE_MIN", "0.1"); monkeypatch.setenv("MAX_SPREAD_CENTS", "5")
+    monkeypatch.setenv("COST_TO_ROOM_MAX", "0.5")
+    assert decision.shadow_settings() == (False, .8, .1) and decision.cost_settings() == (.05, .5)
+    monkeypatch.setenv("SHADOW_SIGNAL_THRESHOLD", "")  # empty value falls back to the default
+    assert decision.shadow_settings()[1] == .60
+
+
+def test_strength_bucket():
+    assert [decision.strength_bucket(s) for s in (.59, .60, .69, .70, .84, .85, 1.0)] == \
+        ["<0.60", "0.60-0.70", "0.60-0.70", "0.70-0.85", "0.70-0.85", "0.85+", "0.85+"]
+    assert decision.strength_bucket(None) is None

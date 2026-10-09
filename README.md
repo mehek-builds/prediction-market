@@ -29,7 +29,7 @@ news pollers (17 RSS feeds + SEC 8-K)   +   Kalshi live tape (WebSocket, optiona
 | `fastlane/feeds.py` | Async pollers with conditional GETs. First poll of each feed is backlog and never traded. |
 | `fastlane/universe.py` | Loads open Kalshi (non-sports) and top Polymarket markets, builds the match index. |
 | `fastlane/jev_client.py` | Pooled HTTP/2 client for the OpenRouter Decisions API, pinned to `typesafe/jev-1.13`. |
-| `fastlane/decision.py` | The per-market Jev questions and the fixed trade thresholds. |
+| `fastlane/decision.py` | The per-market Jev questions, the fixed trade thresholds, the shadow rule and cost filter settings. |
 | `fastlane/books.py` | Order books normalised to ask ladders, book-walking fill, Kalshi fee formula. |
 | `fastlane/engine.py` | Hot path, risk checks, keep-warm pings, price marks. |
 | `fastlane/ledger.py` | SQLite tables: events, decisions (per-stage timings), trades, marks. |
@@ -65,6 +65,11 @@ Environment variables (see `.env.example`):
 | `PAPER_BANKROLL_USD` | optional | Paper bankroll, default 10000. |
 | `PAPER_MAX_TRADE_PCT` | optional | Fraction of bankroll per trade, default 0.02. |
 | `PAPER_DAILY_LOSS_HALT_PCT` | optional | Daily loss halt as a fraction of bankroll, default 0.05. |
+| `MAX_SPREAD_CENTS` | optional | Cost filter: skip a market whose held-side spread (ask minus bid) is over this many cents at decision. Default 3. |
+| `COST_TO_ROOM_MAX` | optional | Cost filter: skip when spread plus both taker fees exceed this fraction of the room to profit (1 minus entry). Default 0.25. |
+| `SHADOW_ENABLED` | optional | Record a shadow book of what a looser rule would have traded, default true. |
+| `SHADOW_SIGNAL_THRESHOLD` | optional | Shadow rule signal threshold, default 0.60 (real rule: 0.85, unchanged). |
+| `SHADOW_DECISIVE_MIN` | optional | Shadow rule decisive minimum, default 0.0 (real rule: 0.30, unchanged). |
 | `FASTLANE_ALLOWED_HOSTS` | optional | Extra Host header values the dashboard API accepts (comma separated). `localhost` and `127.0.0.1` are always allowed; other Hosts get HTTP 400 (DNS rebinding guard). |
 
 What is disabled when the optional ones are empty:
@@ -110,6 +115,43 @@ calibration). The same `priced_in` reason also comes from the freshness guard be
 Then the freshness guards: no trade if the news was published > 10 min before we saw it, or if the Kalshi price
 already moved >= 3c our way since publication. Size = `PAPER_MAX_TRADE_PCT` of bankroll, never paying more than
 best ask + 3 cents or above 95 cents. One position per market, daily loss halt at `PAPER_DAILY_LOSS_HALT_PCT`.
+Then the cost filter: no trade if the live book's spread on the held side is over `MAX_SPREAD_CENTS` (3c) or if the
+round-trip cost (that spread plus the entry and exit Kalshi taker fees per contract, 0 on Polymarket) is more than
+`COST_TO_ROOM_MAX` (25%) of the room to profit, logged as `PASS too_expensive`. The 0.85 / 0.30 thresholds are
+unchanged. Room in the cost filter comes from the live book (1 minus best ask), not the cached quote used for ranking.
+The filter runs after selection, so when the chosen market is too expensive a cheaper second qualifier is not picked
+(the market is still tracked).
+
+## Shadow mode
+
+Why: about three hours of live paper trading produced zero fills. A calibration on 35 live decisions suggested a
+looser rule would have lost money after spread (strong leans blocked only for "not decisive" averaged -7.2c per
+contract), yet many "signal too weak" rows turn green later. The sample is too small to act on, so the real
+thresholds stay put and a shadow book measures the alternative.
+
+What: the same Jev answers, the same scoring, room ranking and no-room fallback, with looser thresholds
+(`SHADOW_SIGNAL_THRESHOLD`, `SHADOW_DECISIVE_MIN`). It is evaluated only when the real `decide()` returned `PASS`; a
+BUY later turned into a PASS by `no_book`, `unknown_market`, `too_expensive`, a freshness guard or a risk check does not
+count, and the decision row records `real_signalled`. A NULL `shadow_reason` means "not evaluated" (synthetic event,
+shadow disabled, or the pass was cancelled at shutdown). It uses the
+same freshness guards, cost filter, fill simulation, fee and sizing, has its own one-position-per-market rule, never
+counts toward the bankroll, the daily loss halt or the real `already_in_market`, and never runs on synthetic
+(`--inject`) events. Paper only: the shadow book places no orders either. A shadow signal threshold below 0.30 does
+nothing, because `irrelevant` fires first.
+
+Strength buckets: shadow P&L is split by signal strength (`0.60-0.70`, `0.70-0.85`, `0.85+`) so one shadow book shows
+where the profitable cutoff is. The `0.85+` bucket is lean-only by construction, because a decisive 0.85+ signal is a
+real trade. Shadow never runs when the real rule signalled a BUY, even if that BUY was later turned into a PASS
+(`no_book`, `unknown_market`, `too_expensive`): those events are recorded as `real_signalled`.
+
+Storage: `trades.shadow = 1` with `signal_strength` and `signal_decisive`; marks live under `shadow:<event_id>` because
+the real `PASS` decision also tracks its own market under the plain event id, and the shadow rule may pick a different
+market on the same event.
+
+Where to see it: the dashboard Shadow tab (with the bucket strip), `/trades?book=shadow`, and the "Shadow vs real"
+section of `python3 -m fastlane.report`.
+
+How to act on it: loosen the real thresholds only if a bucket is profitable after costs over a meaningful sample.
 
 Also: the first poll of every feed is backlog and is never traded. The Kalshi taker fee is
 `0.07 * n * p * (1-p)`, rounded up to the next cent. Price marks are recorded at +5s, 30s, 60s, 5m, 15m and 1h.
@@ -143,6 +185,10 @@ Speed notes:
 
 `fastlane/results/` (gitignored): `ledger.db` (SQLite), `universe.json` (market cache, refreshed every 15 min), and
 benchmark files.
+
+The decision log shows two numbers per judged headline: `price moved` (mid-price move in the leaned direction, before
+costs) and `after costs` (per contract, bought at the ask at decision, sold at the bid at the latest mark, minus taker
+fees). The second is the honest one.
 
 ## Contributing and license
 

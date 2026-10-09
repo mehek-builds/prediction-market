@@ -1,0 +1,37 @@
+from fastlane.ledger import Ledger, columns, mark_key
+
+
+def test_old_ledger_migrates_on_open(old_ledger_path):
+    L = Ledger(old_ledger_path)
+    assert {"shadow", "signal_strength", "signal_decisive"} <= columns(L.db, "trades")
+    assert {"shadow_action", "shadow_reason", "shadow_market_id", "mid_at_published", "mid_at_seen"} <= columns(L.db, "decisions")
+    assert L.db.execute("SELECT shadow, signal_strength FROM trades").fetchall() == [(0, None)]   # old rows are real trades
+    assert L.traded_markets() == {"MK1"} and L.traded_markets(shadow=True) == set()
+    Ledger(old_ledger_path)  # second open is a no-op (no duplicate-column error)
+
+
+def test_shadow_rows_are_separate(tmp_ledger):
+    L = tmp_ledger
+    L.trade(event_id="e1", opened_ts=1e12, venue="kalshi", market_id="MK1", market_question="Q", side="yes",
+            contracts=10, avg_price=.4, cost=4.0, fee=.05, best_ask=.4, synthetic=0, shadow=1, signal_strength=.72)
+    assert L.traded_markets() == set() and L.traded_markets(shadow=True) == {"MK1"}
+    assert L.spent_today() == 0
+    L.decision("e1", action="PASS", reason="weak_signal")
+    L.shadow_decision("e1", "BUY_YES", "signal_yes", "MK1")
+    assert L.db.execute("SELECT shadow_action, shadow_reason, shadow_market_id FROM decisions").fetchone() == ("BUY_YES", "signal_yes", "MK1")
+
+
+def test_mark_key():
+    assert mark_key("abc", False) == "abc" and mark_key("abc", True) == "shadow:abc"
+
+
+def test_fresh_ledger_has_new_columns(tmp_ledger):
+    assert {"shadow", "signal_strength", "signal_decisive"} <= columns(tmp_ledger.db, "trades")
+
+
+def test_marks_event_index_created_and_idempotent(tmp_path, old_ledger_path):
+    from fastlane.ledger import Ledger
+    for path in (tmp_path / "fresh.db", old_ledger_path, old_ledger_path):   # fresh, migrated old, re-opened
+        led = Ledger(path)
+        idx = [r[1] for r in led.db.execute("PRAGMA index_list(marks)")]
+        assert "marks_event" in idx

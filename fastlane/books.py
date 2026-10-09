@@ -9,6 +9,9 @@ KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 POLY_CLOB = "https://clob.polymarket.com"
 MAX_SLIPPAGE = 0.03     # never pay more than best ask + 3 cents
 MAX_ENTRY_PRICE = 0.95  # above this there is almost nothing left to win
+MAX_SPREAD = 0.03         # skip if getting out costs more than 3 cents of spread (env MAX_SPREAD_CENTS)
+COST_TO_ROOM_MAX = 0.25   # skip if round-trip cost (spread + both taker fees) eats over a quarter of the room
+                          # to profit (env COST_TO_ROOM_MAX). "If the cost of trading eats the gains, it's not worth it."
 
 
 @dataclass
@@ -56,6 +59,39 @@ async def fetch_book(client: httpx.AsyncClient, market: dict) -> Book:
 
 def kalshi_taker_fee(contracts: float, price: float) -> float:
     return math.ceil(round(0.07 * contracts * price * (1 - price) * 100, 6)) / 100
+
+
+def taker_fee_per_contract(venue: str, price: float) -> float:
+    """Kalshi 0.07 * p * (1 - p) per contract, unrounded (the per-order cent rounding is applied at fill time); 0 elsewhere."""
+    return 0.07 * price * (1 - price) if venue == "kalshi" else 0.0
+
+
+def round_trip_cost(book: Book, side: str) -> dict | None:
+    """What one contract of `side` costs to buy at the ask and sell back at the bid right now, after both taker fees.
+
+    None when the book lacks an ask or a bid for that side.
+    Keys: entry, exit_bid, spread, fee_in, fee_out, cost, room (room = 1 - entry).
+    """
+    entry, exit_bid = book.best(side), book.bid(side)
+    if entry is None or exit_bid is None:
+        return None
+    spread = max(round(entry - exit_bid, 4), 0.0)   # a crossed book is not a negative cost
+    room = round(1 - entry, 4)
+    fee_in = taker_fee_per_contract(book.venue, entry)
+    fee_out = taker_fee_per_contract(book.venue, exit_bid)
+    return {"entry": entry, "exit_bid": exit_bid, "spread": spread, "fee_in": fee_in, "fee_out": fee_out,
+            "cost": round(spread + fee_in + fee_out, 6), "room": room}
+
+
+def cost_block(book: Book, side: str, max_spread: float = MAX_SPREAD,
+               cost_to_room_max: float = COST_TO_ROOM_MAX) -> str | None:
+    """'too_expensive' | None. Deterministic: spread > max_spread, or cost > cost_to_room_max * room."""
+    c = round_trip_cost(book, side)
+    if c is None:
+        return None  # the fill guard handles empty ladders
+    if c["spread"] > round(max_spread, 4) or c["cost"] > round(cost_to_room_max * c["room"], 6):
+        return "too_expensive"
+    return None
 
 
 def simulate_fill(book: Book, side: str, budget_usd: float) -> dict | None:

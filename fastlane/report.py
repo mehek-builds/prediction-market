@@ -4,7 +4,9 @@ import sqlite3
 import time
 from collections import defaultdict
 
-from fastlane.ledger import DB_PATH
+from fastlane.config import load_env
+from fastlane.decision import BUCKET_EDGES, DECISIVE_MIN, SIGNAL_THRESHOLD, shadow_settings, strength_bucket
+from fastlane.ledger import DB_PATH, columns, mark_key
 
 HORIZONS = [0, 5, 30, 60, 300, 900, 3600]
 
@@ -97,11 +99,16 @@ def main(since_minutes: float | None):
 
     timeline(db, rows)
 
-    trades = db.execute("""SELECT event_id, venue, market_question, side, contracts, avg_price, cost, fee, opened_ts
+    cols = columns(db, "trades")
+    all_trades = db.execute(f"""SELECT event_id, venue, market_question, side, contracts, avg_price, cost, fee, opened_ts,
+                           {"shadow" if "shadow" in cols else "0 AS shadow"},
+                           {"signal_strength" if "signal_strength" in cols else "NULL AS signal_strength"}
                            FROM trades WHERE synthetic = 0 AND opened_ts > ?""", (since,)).fetchall()
+    trades = [t for t in all_trades if not t[9]]   # the real paper book
+    shadow = [t for t in all_trades if t[9]]       # what the looser shadow rule would have added
     print(f"\nPaper trades: {len(trades)}")
     tot = defaultdict(float)
-    for eid, venue, q, side, n, px, cost, fee, ts in trades:
+    for eid, venue, q, side, n, px, cost, fee, ts, _sh, _sig in trades:
         m = marks.get(eid, {})
         cells = []
         for h in HORIZONS[1:]:
@@ -115,6 +122,58 @@ def main(since_minutes: float | None):
         print(f"  {side.upper():3} {n:g} @ {px} (${cost} + ${fee} fee) {venue}: {q[:60]}\n      " + "  ".join(cells))
     if trades:
         print("  Total mark-to-bid P&L: " + "  ".join(f"+{h}s ${v:+.2f}" for h, v in sorted(tot.items())))
+    shadow_section(trades, shadow, marks, {r[0]: r[13] for r in rows})
+
+
+def _per_contract(t, m):
+    """{horizon: P&L per contract after spread (exit at the held-side bid) and fees} for one trade."""
+    _eid, _venue, _q, side, n, px, _cost, fee, _ts, _sh, _sig = t
+    out = {}
+    for h in HORIZONS[1:]:
+        if h in m:
+            ya, yb, _ = m[h]
+            exit_px = yb if side == "yes" else (1 - ya if ya is not None else None)
+            if exit_px is not None and n:
+                out[h] = exit_px - px - fee / n
+    return out
+
+
+def shadow_section(real, shadow, marks, reasons):
+    """Shadow vs real, per contract after spread and fees, with the shadow book split by signal strength."""
+    enabled, sig, dec = shadow_settings()
+    print(f"\nShadow vs real{'' if enabled else ' (shadow mode disabled)'} (shadow rule: signal >= {sig:.2f}, "
+          f"decisive >= {dec:.2f}; real: {SIGNAL_THRESHOLD:.2f} / {DECISIVE_MIN:.2f}; both after the cost filter).")
+    print("Shadow = what loosening would ADD, per contract after spread and fees.")
+    if not real and not shadow:
+        print("  no real or shadow trades in range")
+        return
+    groups = [("real", real), ("shadow all", shadow)]
+    labels = [f"<{BUCKET_EDGES[0]:.2f}", *(f"{lo:.2f}-{hi:.2f}" for lo, hi in zip(BUCKET_EDGES, BUCKET_EDGES[1:])),
+              f"{BUCKET_EDGES[-1]:.2f}+"]
+    for label in labels:
+        groups.append((f"shadow {label}", [t for t in shadow if strength_bucket(t[10]) == label]))
+    unknown = [t for t in shadow if strength_bucket(t[10]) is None]
+    if unknown:
+        groups.append(("shadow unknown", unknown))
+    stats = [(name, ts, [_per_contract(t, marks.get(mark_key(t[0], t[9]), {})) for t in ts])
+             for name, ts in groups if ts]
+    horizons = [h for h in HORIZONS[1:] if any(h in pc for _, _, pcs in stats for pc in pcs)]
+    print(f"  {'book / signal':18} {'n':>3}" + "".join(f"   {'+' + str(h) + 's avg':>11}   up/down" for h in horizons))
+    for name, ts, pcs in stats:
+        cells = []
+        for h in horizons:
+            vals = [pc[h] for pc in pcs if h in pc]
+            if vals:
+                up, down = sum(v > 0 for v in vals), sum(v < 0 for v in vals)
+                cells.append(f"   {sum(vals) / len(vals) * 100:>+10.1f}c   {up}/{down}")
+            else:
+                cells.append(f"   {'-':>11}   -")
+        print(f"  {name:18} {len(ts):>3}" + "".join(cells))
+    if shadow:
+        why = defaultdict(int)
+        for t in shadow:
+            why[reasons.get(t[0]) or "unknown"] += 1
+        print("  shadow trades by real reason: " + ", ".join(f"{k} {v}" for k, v in sorted(why.items())))
 
 
 def timeline(db, rows):
@@ -159,4 +218,5 @@ def timeline(db, rows):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--since-minutes", type=float)
+    load_env()  # so the shadow thresholds printed match the engine's .env
     main(ap.parse_args().since_minutes)

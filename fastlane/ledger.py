@@ -20,12 +20,14 @@ CREATE TABLE IF NOT EXISTS decisions (
     -- market_conf = signal strength, p_up/p_down = YES-side/NO-side probability mass, materiality = P(decisive)
     market_conf REAL, p_up REAL, p_down REAL, materiality REAL,
     action TEXT, reason TEXT, jev_cost REAL, answers TEXT,
-    mid_at_decision REAL, mid_at_published REAL, mid_at_seen REAL
+    mid_at_decision REAL, mid_at_published REAL, mid_at_seen REAL,
+    shadow_action TEXT, shadow_reason TEXT, shadow_market_id TEXT
 );
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, opened_ts REAL, venue TEXT, market_id TEXT,
     market_question TEXT, side TEXT, contracts REAL, avg_price REAL, cost REAL, fee REAL,
-    best_ask REAL, synthetic INTEGER DEFAULT 0
+    best_ask REAL, synthetic INTEGER DEFAULT 0,
+    shadow INTEGER DEFAULT 0, signal_strength REAL, signal_decisive REAL
 );
 CREATE TABLE IF NOT EXISTS ticks (
     market_id TEXT, ts REAL, yes_bid REAL, yes_ask REAL
@@ -37,6 +39,32 @@ CREATE TABLE IF NOT EXISTS marks (
 );
 """
 
+MIGRATIONS = [  # (table, column, type): added to ledgers created before the column existed
+    ("decisions", "mid_at_published", "REAL"), ("decisions", "mid_at_seen", "REAL"),
+    ("decisions", "shadow_action", "TEXT"), ("decisions", "shadow_reason", "TEXT"),
+    ("decisions", "shadow_market_id", "TEXT"),
+    ("trades", "shadow", "INTEGER DEFAULT 0"), ("trades", "signal_strength", "REAL"), ("trades", "signal_decisive", "REAL"),
+]
+
+# Marks are keyed by event id. The real path records horizon-0 and scheduled marks under the event id for EVERY chosen
+# market, including PASS decisions (calibration). The shadow rule can pick a different market on the same event, so a
+# shadow trade gets its own key. Event ids are 16-hex feed hashes, `move-<ticker>-<ts>` or `syn-<hash>`, so the prefix
+# cannot collide with a real id.
+SHADOW_MARK_PREFIX = "shadow:"
+
+
+INDEX_MIGRATIONS = [  # idempotent; the dashboard API looks marks up by event_id several times per decision row
+    "CREATE INDEX IF NOT EXISTS marks_event ON marks (event_id, horizon_s)",
+]
+
+
+def mark_key(event_id: str, shadow: bool) -> str:
+    return f"{SHADOW_MARK_PREFIX}{event_id}" if shadow else event_id
+
+
+def columns(db: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+
 
 class Ledger:
     def __init__(self, path: Path = DB_PATH):
@@ -44,10 +72,11 @@ class Ledger:
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
-        cols = {r[1] for r in self.db.execute("PRAGMA table_info(decisions)")}
-        for col in ("mid_at_published", "mid_at_seen"):
-            if col not in cols:
-                self.db.execute(f"ALTER TABLE decisions ADD COLUMN {col} REAL")
+        for table, col, typ in MIGRATIONS:
+            if col not in columns(self.db, table):
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        for stmt in INDEX_MIGRATIONS:
+            self.db.execute(stmt)
 
     def event(self, e: dict):
         self.db.execute(
@@ -75,10 +104,15 @@ class Ledger:
     def tick(self, market_id: str, ts: float, bid: float, ask: float):
         self.db.execute("INSERT INTO ticks VALUES (?,?,?,?)", (market_id, ts, bid, ask))
 
-    def traded_markets(self) -> set[str]:
-        return {r[0] for r in self.db.execute("SELECT market_id FROM trades WHERE synthetic = 0")}
+    def shadow_decision(self, event_id: str, action: str | None, reason: str | None, market_id: str | None = None):
+        self.db.execute("UPDATE decisions SET shadow_action = ?, shadow_reason = ?, shadow_market_id = ? "
+                        "WHERE event_id = ?", (action, reason, market_id, event_id))
+
+    def traded_markets(self, shadow: bool = False) -> set[str]:
+        return {r[0] for r in self.db.execute("SELECT market_id FROM trades WHERE synthetic = 0 AND shadow = ?",
+                                              (int(shadow),))}
 
     def spent_today(self) -> float:
         start = time.time() - 86400
-        return self.db.execute("SELECT COALESCE(SUM(cost + fee), 0) FROM trades WHERE opened_ts > ? AND synthetic = 0",
+        return self.db.execute("SELECT COALESCE(SUM(cost + fee), 0) FROM trades WHERE opened_ts > ? AND synthetic = 0 AND shadow = 0",
                                (start,)).fetchone()[0]

@@ -1,5 +1,6 @@
 import base64
 import os
+import sqlite3
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -9,7 +10,36 @@ from fastlane import books
 from fastlane.ledger import Ledger
 from fastlane.universe import Universe
 
-_ENV_VARS = ["OPENROUTER_API_KEY", "JEV_MODEL", "SEC_USER_AGENT", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH"]
+_ENV_VARS = ["OPENROUTER_API_KEY", "JEV_MODEL", "SEC_USER_AGENT", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
+             "SHADOW_ENABLED", "SHADOW_SIGNAL_THRESHOLD", "SHADOW_DECISIVE_MIN", "MAX_SPREAD_CENTS", "COST_TO_ROOM_MAX"]
+
+OLD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY, source TEXT, headline TEXT, summary TEXT, url TEXT,
+    published_ts REAL, seen_ts REAL, synthetic INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS decisions (
+    event_id TEXT PRIMARY KEY, decided_ts REAL,
+    n_candidates INTEGER, shortlist_ms REAL, jev_ms REAL, book_ms REAL, total_ms REAL,
+    venue TEXT, market_id TEXT, market_question TEXT,
+    market_conf REAL, p_up REAL, p_down REAL, materiality REAL,
+    action TEXT, reason TEXT, jev_cost REAL, answers TEXT,
+    mid_at_decision REAL, mid_at_published REAL, mid_at_seen REAL
+);
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, opened_ts REAL, venue TEXT, market_id TEXT,
+    market_question TEXT, side TEXT, contracts REAL, avg_price REAL, cost REAL, fee REAL,
+    best_ask REAL, synthetic INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ticks (
+    market_id TEXT, ts REAL, yes_bid REAL, yes_ask REAL
+);
+CREATE INDEX IF NOT EXISTS ticks_market_ts ON ticks (market_id, ts);
+CREATE TABLE IF NOT EXISTS marks (
+    event_id TEXT, horizon_s INTEGER, ts REAL, yes_ask REAL, yes_bid REAL, mid REAL,
+    PRIMARY KEY (event_id, horizon_s)
+);
+"""  # the v0.1.1 ledger schema, kept verbatim to test migration and read-only API tolerance
 
 
 @pytest.fixture(autouse=True)
@@ -70,3 +100,20 @@ def book_factory():
 @pytest.fixture
 def tmp_ledger(tmp_path) -> Ledger:
     return Ledger(tmp_path / "ledger.db")
+
+
+@pytest.fixture
+def old_ledger_path(tmp_path):
+    """A ledger file in the v0.1.1 schema with one live event, decision, trade and mark."""
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.executescript(OLD_SCHEMA)
+    db.execute("INSERT INTO events VALUES ('e1','cnbc','Old news','','http://x',900.0,905.0,0)")
+    db.execute("INSERT INTO decisions (event_id, decided_ts, action, reason, venue, market_id, market_question, "
+               "market_conf, p_up, p_down, materiality, mid_at_decision) "
+               "VALUES ('e1',906.0,'BUY_YES','signal_yes','kalshi','MK1','Q1?',.9,.9,.05,.6,.40)")
+    db.execute("INSERT INTO trades (event_id, opened_ts, venue, market_id, market_question, side, contracts, "
+               "avg_price, cost, fee, best_ask, synthetic) VALUES ('e1',906.0,'kalshi','MK1','Q1?','yes',10,.4,4.0,.05,.4,0)")
+    db.execute("INSERT INTO marks VALUES ('e1',5,911.0,.47,.45,.46)")
+    db.commit(); db.close()
+    return path
