@@ -6,8 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastlane.config import RESULTS_DIR
+from fastlane.decision import shadow_settings
 
 DB_PATH = RESULTS_DIR / "ledger.db"
+
+SETTINGS_DDL = "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_ts REAL)"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -44,7 +47,7 @@ CREATE TABLE IF NOT EXISTS x_spend (
 CREATE TABLE IF NOT EXISTS feed_status (
     name TEXT PRIMARY KEY, connected INTEGER DEFAULT 0, updated_ts REAL, info TEXT
 );
-"""
+""" + SETTINGS_DDL + ";\n"
 
 MIGRATIONS = [  # (table, column, type): added to ledgers created before the column existed
     ("decisions", "mid_at_published", "REAL"), ("decisions", "mid_at_seen", "REAL"),
@@ -62,6 +65,7 @@ SHADOW_MARK_PREFIX = "shadow:"
 
 INDEX_MIGRATIONS = [  # idempotent; the dashboard API looks marks up by event_id several times per decision row
     "CREATE INDEX IF NOT EXISTS marks_event ON marks (event_id, horizon_s)",
+    "CREATE INDEX IF NOT EXISTS ticks_ts ON ticks (ts)",  # /status reads MAX(ts) and a 1h count over ticks
 ]
 
 
@@ -72,6 +76,21 @@ def utc_day(ts: float | None = None) -> str:
 
 def mark_key(event_id: str, shadow: bool) -> str:
     return f"{SHADOW_MARK_PREFIX}{event_id}" if shadow else event_id
+
+
+def shadow_enabled_from(db: sqlite3.Connection) -> tuple[bool, str]:
+    """(enabled, source). The ledger row wins; without one, env SHADOW_ENABLED (default true) via shadow_settings().
+
+    Tolerates a ledger without the settings table (old file not yet opened by the engine): falls back to env."""
+    try:
+        row = db.execute("SELECT value FROM settings WHERE key = 'shadow_enabled'").fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise   # transient (locked, busy): the caller keeps its previous value
+        row = None
+    if row:
+        return row[0] == "1", "ledger"
+    return shadow_settings()[0], "env"
 
 
 def columns(db: sqlite3.Connection, table: str) -> set[str]:
@@ -89,6 +108,14 @@ class Ledger:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         for stmt in INDEX_MIGRATIONS:
             self.db.execute(stmt)
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_setting(self, key: str, value: str):
+        self.db.execute("INSERT OR REPLACE INTO settings (key, value, updated_ts) VALUES (?, ?, ?)",
+                        (key, value, time.time()))
 
     def event(self, e: dict):
         self.db.execute(

@@ -67,3 +67,68 @@ def test_utc_day():
     assert utc_day(1_700_000_000) == "2023-11-14"
     midnight = 1_699_920_000                       # 2023-11-14 00:00:00 UTC
     assert utc_day(midnight - 1) == "2023-11-13" and utc_day(midnight) == "2023-11-14"
+
+
+def test_settings_table_and_precedence(tmp_ledger, monkeypatch):
+    from fastlane.ledger import shadow_enabled_from
+    L = tmp_ledger
+    assert L.get_setting("shadow_enabled") is None
+    assert shadow_enabled_from(L.db) == (True, "env")                   # no row, no env: default true
+    monkeypatch.setenv("SHADOW_ENABLED", "false")
+    assert shadow_enabled_from(L.db) == (False, "env")
+    L.set_setting("shadow_enabled", "1")
+    assert shadow_enabled_from(L.db) == (True, "ledger")                # row wins over env
+    L.set_setting("shadow_enabled", "0")
+    assert L.get_setting("shadow_enabled") == "0" and shadow_enabled_from(L.db) == (False, "ledger")
+
+
+def test_set_setting_replaces_and_stamps(tmp_ledger):
+    L = tmp_ledger
+    L.set_setting("shadow_enabled", "1")
+    L.set_setting("shadow_enabled", "0")
+    rows = L.db.execute("SELECT key, value, updated_ts FROM settings").fetchall()
+    assert len(rows) == 1 and rows[0][:2] == ("shadow_enabled", "0") and rows[0][2] == pytest.approx(time.time(), abs=5)
+
+
+def test_shadow_enabled_from_tolerates_missing_table():
+    import sqlite3
+    from fastlane.ledger import shadow_enabled_from
+    db = sqlite3.connect(":memory:")                                    # no settings table at all
+    assert shadow_enabled_from(db) == (True, "env")
+
+
+def test_settings_table_migrates_on_old_ledger(old_ledger_path):
+    L = Ledger(old_ledger_path)
+    assert "settings" in {r[0] for r in L.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    Ledger(old_ledger_path)                                              # idempotent
+
+
+def _index_names(L):
+    return {r[0] for r in L.db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+
+
+def test_ticks_ts_index_on_fresh_and_old_ledger_idempotent(tmp_path, old_ledger_path):
+    fresh = Ledger(tmp_path / "fresh.db")
+    assert "ticks_ts" in _index_names(fresh)
+    Ledger(tmp_path / "fresh.db")                                        # reopen: no "already exists" error
+    old = Ledger(old_ledger_path)
+    assert "ticks_ts" in _index_names(old)
+    assert Ledger(old_ledger_path) and "ticks_ts" in _index_names(Ledger(old_ledger_path))
+
+
+def test_index_migrations_list_includes_ticks_ts():
+    from fastlane.ledger import INDEX_MIGRATIONS
+    assert any("ticks_ts" in s and "ON ticks (ts)" in s for s in INDEX_MIGRATIONS)
+    assert all("IF NOT EXISTS" in s for s in INDEX_MIGRATIONS)
+
+
+def test_shadow_enabled_from_reraises_transient_errors():
+    import sqlite3
+    from fastlane.ledger import shadow_enabled_from
+
+    class Locked:
+        def execute(self, *a):
+            raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError):
+        shadow_enabled_from(Locked())

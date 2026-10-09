@@ -275,7 +275,7 @@ class XFeed:
         self.st.update(budget_hit=over, in_window=inside, calls_today=calls, spend_today_usd=usd)
         self.ledger.feed_status_set("x", connected=result is None, info={
             "enabled": True, "budget_hit": over, "in_window": inside, "calls_today": calls,
-            "spend_today_usd": round(usd, 4)})
+            "spend_today_usd": round(usd, 4), "budget_usd": s.budget_usd})
         return result
 
     async def poll_once(self) -> int:
@@ -292,10 +292,12 @@ class XFeed:
         except (httpx.ConnectError, httpx.ConnectTimeout):
             raise                                      # the request never reached xAI: nothing to charge
         except (httpx.TimeoutException, httpx.ReadError, httpx.RemoteProtocolError):
-            # sent but no answer (read/write/pool timeout, dropped connection): most likely billed, so charge the estimate
+            # No answer: read/write timeout or a dropped connection after the request went out (most likely billed).
+            # A PoolTimeout may never have been sent; it is charged anyway, conservatively, so the budget errs high.
             self.ledger.x_spend_add(day, ASSUMED_CALL_COST_USD, calls=1)
             self._note_cost(day, ASSUMED_CALL_COST_USD)
             self.st["polls"] += 1
+            self.st["errors"] += 1
             raise
         self.st["polls"] += 1
         self.st["last_ms"] = round((time.perf_counter() - started) * 1000)

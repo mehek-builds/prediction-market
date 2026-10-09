@@ -4,6 +4,7 @@ Paper only. Nothing here can place a real order: there is no order endpoint anyw
 """
 import asyncio
 import os
+import sqlite3
 import time
 
 import httpx
@@ -15,7 +16,7 @@ from fastlane.feeds import FeedHub
 from fastlane.jev_client import JevClient
 from fastlane.kalshi import KalshiClient
 from fastlane.kalshi_tape import KalshiTape, move_deny_re
-from fastlane.ledger import Ledger, mark_key
+from fastlane.ledger import Ledger, mark_key, shadow_enabled_from
 from fastlane.universe import Universe
 from fastlane.x_feed import XFeed
 
@@ -53,7 +54,10 @@ class Engine:
         self.bankroll = float(os.environ.get("PAPER_BANKROLL_USD", 10000))
         self.max_trade = self.bankroll * float(os.environ.get("PAPER_MAX_TRADE_PCT", 0.02))
         self.halt_loss = self.bankroll * float(os.environ.get("PAPER_DAILY_LOSS_HALT_PCT", 0.05))
-        self.shadow_enabled, self.shadow_signal, self.shadow_decisive = shadow_settings()
+        _, self.shadow_signal, self.shadow_decisive = shadow_settings()
+        self._shadow_on = shadow_settings()[0]      # env fallback until the first ledger read
+        self._shadow_checked_ts = 0.0
+        self.shadow_check_s = 2.0                   # re-read the ledger setting at most this often
         self.max_spread, self.cost_to_room_max, self.min_entry = cost_settings()
         self.workers = workers
         self.verbose = verbose
@@ -81,6 +85,21 @@ class Engine:
         self._tasks: list[asyncio.Task] = []
         self._bg: set[asyncio.Task] = set()
         self._shadow_tasks: set[asyncio.Task] = set()
+
+    @property
+    def shadow_enabled(self) -> bool:
+        """Runtime shadow switch: ledger `settings.shadow_enabled` wins, else env SHADOW_ENABLED. Cached 2 s.
+
+        Read only on the shadow branch, after the real decision, fill, marks and decision row are recorded, so the
+        real path never waits on it. One primary-key lookup on the engine's own connection."""
+        now = time.monotonic()
+        if now - self._shadow_checked_ts >= self.shadow_check_s:
+            try:
+                self._shadow_on = shadow_enabled_from(self.ledger.db)[0]
+            except sqlite3.OperationalError:
+                pass   # transient read error: keep the previous cached value, retry in 2 s
+            self._shadow_checked_ts = now
+        return self._shadow_on
 
     # ---------- lifecycle ----------
     async def start(self, feeds: bool = True):
@@ -112,6 +131,7 @@ class Engine:
                 print(f"x feed: {len(s.handles)} handles every {s.poll_seconds:.0f}s, window {s.start:%H:%M}-{s.end:%H:%M} "
                       f"{s.tz.key} on {len(s.days)} weekdays, budget ${s.budget_usd:.2f}/UTC day")
             else:
+                self.ledger.feed_status_set("x", connected=False, info={"enabled": False})   # never stay stuck at enabled
                 print("x feed off (no XAI_API_KEY)")
             if self.bsky.enabled:
                 self._tasks.append(asyncio.create_task(self.bsky.run()))
@@ -472,4 +492,5 @@ class Engine:
         b = (f"bsky {bs.get('mode')} {'up' if bs.get('connected') else 'DOWN'} {bs.get('new', 0)} posts"
              if self.bsky.enabled else "bsky off")
         return (f"[status] polls {polls} | new items {new} | decided {self.processed} | paper trades {self.trades} | shadow {self.shadow_trades} "
-                f"| queue {self.queue.qsize()} | {tape} | {x} | {b}" + (f" | dead feeds: {', '.join(bad)}" if bad else ""))
+                f"| queue {self.queue.qsize()} | {tape} | {x} | {b} "
+                f"| shadow mode {'on' if self.shadow_enabled else 'off'}" + (f" | dead feeds: {', '.join(bad)}" if bad else ""))

@@ -205,7 +205,7 @@ def test_socket_failure_falls_back_to_polling(tmp_ledger, monkeypatch):
     asyncio.run(go())
     assert stats["bsky"]["mode"] == "poll" and stats["bsky"]["reconnects"] >= 1
     st = tmp_ledger.feed_status("bsky")
-    assert st["connected"] is False and st["info"] == {"mode": "poll"}
+    assert st["connected"] is True and st["info"] == {"mode": "poll"}   # polls succeed: heartbeat says connected
 
 
 class FakeWS:
@@ -252,3 +252,143 @@ def test_rkey_validated():
         m = commit()
         m["commit"]["rkey"] = bad
         assert parse_jetstream(m, DIDS, SEEN) is None, bad
+
+
+# ---------- v0.4.0 late fixes: poll-mode heartbeat, host alternation ----------
+def _run_for(feed, seconds):
+    async def go():
+        try:
+            await asyncio.wait_for(feed.run(), seconds)
+        except asyncio.TimeoutError:
+            pass
+    asyncio.run(go())
+
+
+def _fast(monkeypatch, fallback=0.05):
+    monkeypatch.setattr(bluesky, "FALLBACK_FOR_S", fallback)
+    monkeypatch.setattr(bluesky, "POLL_S", 0.01)
+    real_sleep = asyncio.sleep
+
+    async def quick(d, *a, **k):                 # collapse reconnect backoff (2 s, 4 s ...) to a blink
+        return await real_sleep(min(d, 0.01), *a, **k)
+    monkeypatch.setattr(bluesky.asyncio, "sleep", quick)
+
+
+def _refuse(urls):
+    def connect(url, *a, **k):
+        urls.append(url)
+        raise OSError("refused")
+    return connect
+
+
+def test_poll_mode_heartbeat_true_while_polls_succeed(tmp_ledger, monkeypatch):
+    import time
+    _fast(monkeypatch, fallback=0.5)
+    monkeypatch.setenv("BSKY_HANDLES", "reuters.com")
+    feed = BlueskyFeed(asyncio.Queue(), {}, tmp_ledger, client=FakeClient(), ws_connect=_refuse([]), now=time.time)
+    _run_for(feed, 0.15)
+    st = tmp_ledger.feed_status("bsky")
+    assert st["connected"] is True and st["info"] == {"mode": "poll"}
+
+
+def test_poll_mode_heartbeat_false_when_polls_fail(tmp_ledger, monkeypatch):
+    import time
+
+    class FeedDown(FakeClient):
+        async def get(self, url, **kw):
+            if "getAuthorFeed" in url:
+                return FakeResp(503, {})
+            return await super().get(url, **kw)
+
+    _fast(monkeypatch, fallback=0.5)
+    monkeypatch.setenv("BSKY_HANDLES", "reuters.com")
+    stats = {}
+    feed = BlueskyFeed(asyncio.Queue(), stats, tmp_ledger, client=FeedDown(), ws_connect=_refuse([]), now=time.time)
+    _run_for(feed, 0.15)
+    st = tmp_ledger.feed_status("bsky")
+    assert st["connected"] is False and st["info"] == {"mode": "poll"} and stats["bsky"]["errors"] >= 1
+
+
+def test_poll_mode_heartbeat_recovers_after_a_failed_round(tmp_ledger, monkeypatch):
+    import time
+
+    class Flaky(FakeClient):
+        n = 0
+
+        async def get(self, url, **kw):
+            if "getAuthorFeed" in url:
+                Flaky.n += 1
+                if Flaky.n <= 2:
+                    return FakeResp(503, {})
+            return await super().get(url, **kw)
+
+    _fast(monkeypatch, fallback=0.5)
+    monkeypatch.setenv("BSKY_HANDLES", "reuters.com")
+    feed = BlueskyFeed(asyncio.Queue(), {}, tmp_ledger, client=Flaky(), ws_connect=_refuse([]), now=time.time)
+    _run_for(feed, 0.2)
+    assert tmp_ledger.feed_status("bsky")["connected"] is True
+
+
+def test_poll_heartbeat_fires_after_each_handle_not_only_at_round_end(tmp_ledger, monkeypatch):
+    import time
+    calls, seen_at = [], []
+    real_set = tmp_ledger.feed_status_set
+    monkeypatch.setattr(tmp_ledger, "feed_status_set", lambda *a, **k: (calls.append(a), real_set(*a, **k))[1])
+
+    class Slow(FakeClient):
+        async def get(self, url, **kw):
+            if "getAuthorFeed" in url:
+                seen_at.append(len(calls))          # heartbeats written before this handle's poll starts
+                await asyncio.sleep(0.02)
+                return FakeResp(503, {})
+            return await super().get(url, **kw)
+
+    _fast(monkeypatch, fallback=0.5)
+    monkeypatch.setenv("BSKY_HANDLES", "a.test,b.test,c.test")
+    client = Slow(dids={"a.test": "did:plc:a", "b.test": "did:plc:b", "c.test": "did:plc:c"})
+    feed = BlueskyFeed(asyncio.Queue(), {}, tmp_ledger, client=client, ws_connect=_refuse([]), now=time.time)
+    _run_for(feed, 0.2)
+    assert len(seen_at) >= 3
+    assert seen_at[1] > seen_at[0] and seen_at[2] > seen_at[1]   # a beat landed between consecutive handles
+    assert tmp_ledger.feed_status("bsky")["connected"] is False
+
+
+def test_jetstream_url_host_builder_is_pure():
+    dids = ["did:plc:a"]
+    two = jetstream_url(dids, "jetstream2.us-east.bsky.network")
+    one = jetstream_url(dids, "jetstream1.us-east.bsky.network")
+    assert two.startswith("wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post")
+    assert one.startswith("wss://jetstream1.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post")
+    assert two.split("/subscribe", 1)[1] == one.split("/subscribe", 1)[1]            # only the host differs
+    assert jetstream_url(dids) == JETSTREAM_URL + two.split("/subscribe", 1)[1]      # default host unchanged
+    assert jetstream_url(dids, "jetstream2.us-east.bsky.network") == jetstream_url(dids)
+    assert bluesky.JETSTREAM_HOSTS == ("jetstream2.us-east.bsky.network", "jetstream1.us-east.bsky.network")
+
+
+def test_reconnects_alternate_jetstream_hosts(tmp_ledger, monkeypatch):
+    import time
+    _fast(monkeypatch, fallback=0.03)
+    monkeypatch.setenv("BSKY_HANDLES", "reuters.com")
+    urls = []
+    feed = BlueskyFeed(asyncio.Queue(), {}, tmp_ledger, client=FakeClient(), ws_connect=_refuse(urls), now=time.time)
+    _run_for(feed, 0.6)
+    hosts = [u.split("/")[2].split(".")[0] for u in urls]
+    assert len(hosts) >= 3
+    assert hosts[:3] == ["jetstream2", "jetstream1", "jetstream2"]
+
+
+def test_socket_down_log_names_host_and_close_info(tmp_ledger, monkeypatch, capsys):
+    import time
+    _fast(monkeypatch, fallback=0.02)
+    monkeypatch.setenv("BSKY_HANDLES", "reuters.com")
+    feed = BlueskyFeed(asyncio.Queue(), {}, tmp_ledger, client=FakeClient(), ws_connect=_refuse([]), now=time.time)
+    _run_for(feed, 0.1)
+    out = capsys.readouterr().out
+    assert "host jetstream2.us-east.bsky.network" in out and "no close frame" in out
+
+    class Frame:
+        code, reason = 1011, "internal"
+    exc = OSError("closed")
+    exc.rcvd = Frame()
+    msg = BlueskyFeed._close_info(exc)
+    assert "close code 1011" in msg and "internal" in msg

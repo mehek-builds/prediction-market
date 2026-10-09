@@ -330,7 +330,6 @@ def test_settings_repr_hides_key(monkeypatch):
 def test_post_url_id_is_end_anchored():
     now = time.time()
     sid = snowflake_at(now)
-    long_id = f"{sid}{'0' * (23 - len(str(sid)))}" if len(str(sid)) < 23 else f"{sid}0"
     url = f"https://x.com/A/status/{'1' * 23}"
     out, counts = parse_posts(json.dumps({"posts": [{"url": url, "text": "x"}]}), ("A",), 0, 1e12)
     assert out == [] and counts["malformed"] == 1
@@ -346,3 +345,31 @@ def test_in_window_across_dst(monkeypatch):
     assert in_window(s, utc(2026, 3, 9, 13, 0)) and not in_window(s, utc(2026, 3, 9, 12, 59))     # EDT from Mar 8
     assert in_window(s, utc(2026, 11, 2, 14, 0)) and not in_window(s, utc(2026, 11, 2, 13, 59))   # EST from Nov 1
     assert not in_window(s, utc(2026, 11, 2, 13, 30))
+
+
+@pytest.mark.parametrize("exc", [httpx.ReadTimeout("t"), httpx.WriteTimeout("t"), httpx.PoolTimeout("t"),
+                                 httpx.ReadError("r"), httpx.RemoteProtocolError("p")])
+def test_timeouts_and_drops_increment_errors_counter(tmp_ledger, monkeypatch, exc):
+    clock = [et(2026, 10, 12, 10, 0)]
+    feed, stats = _raising_feed(tmp_ledger, monkeypatch, exc, clock)
+    for n in (1, 2):
+        with pytest.raises(type(exc)):
+            asyncio.run(feed.poll_once())
+        assert stats["x"]["errors"] == n
+
+
+@pytest.mark.parametrize("exc", [httpx.ConnectError("c"), httpx.ConnectTimeout("t")])
+def test_connect_failure_does_not_touch_charge_or_spend(tmp_ledger, monkeypatch, exc):
+    clock = [et(2026, 10, 12, 10, 0)]
+    feed, stats = _raising_feed(tmp_ledger, monkeypatch, exc, clock)
+    with pytest.raises(type(exc)):
+        asyncio.run(feed.poll_once())
+    assert tmp_ledger.x_spend(utc_day(clock[0])) == (0, 0.0)
+
+
+def test_gate_heartbeat_carries_budget_usd(tmp_ledger, monkeypatch):
+    clock = [et(2026, 10, 12, 12, 0)]
+    feed, _, _ = make_feed(tmp_ledger, monkeypatch, [], clock, budget="7.5")
+    assert feed.gate() is None
+    info = tmp_ledger.feed_status("x")["info"]
+    assert info["enabled"] is True and info["budget_usd"] == 7.5

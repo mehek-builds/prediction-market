@@ -18,7 +18,8 @@ import websockets
 
 from fastlane.feeds import _clean
 
-JETSTREAM_URL = "wss://jetstream2.us-east.bsky.network/subscribe"
+JETSTREAM_HOSTS = ("jetstream2.us-east.bsky.network", "jetstream1.us-east.bsky.network")   # alternate on reconnect
+JETSTREAM_URL = f"wss://{JETSTREAM_HOSTS[0]}/subscribe"
 PUBLIC_API = "https://public.api.bsky.app/xrpc"
 POST_COLLECTION = "app.bsky.feed.post"
 RKEY_RE = re.compile(r"[A-Za-z0-9._:~-]{1,512}")
@@ -59,10 +60,12 @@ def bsky_settings(env=None) -> BskySettings:
     return BskySettings(enabled, tuple(handles))
 
 
-def jetstream_url(dids) -> str:
-    """JETSTREAM_URL + '?wantedCollections=app.bsky.feed.post' + '&wantedDids=<did>' per did (urlencoded)."""
+def jetstream_url(dids, host: str | None = None) -> str:
+    """wss://<host>/subscribe (default JETSTREAM_URL) + '?wantedCollections=app.bsky.feed.post' + '&wantedDids=<did>'
+    per did (urlencoded). Pure: the caller picks the host."""
     q = f"wantedCollections={POST_COLLECTION}"
-    return JETSTREAM_URL + "?" + q + "".join("&" + urlencode({"wantedDids": d}) for d in dids)
+    base = JETSTREAM_URL if host is None else f"wss://{host}/subscribe"
+    return base + "?" + q + "".join("&" + urlencode({"wantedDids": d}) for d in dids)
 
 
 def iso_ts(s) -> float | None:
@@ -160,6 +163,14 @@ class BlueskyFeed:
         self.st.update(mode=mode, connected=connected)
         self.ledger.feed_status_set("bsky", connected, {"mode": mode})
 
+    @staticmethod
+    def _close_info(exc: BaseException) -> str:
+        """repr plus the close code/reason when the exception carries a close frame (either direction)."""
+        frame = getattr(exc, "rcvd", None) or getattr(exc, "sent", None)
+        if frame is None:
+            return f"{exc!r} (no close frame)"
+        return f"{exc!r} (close code {getattr(frame, 'code', None)}, reason {getattr(frame, 'reason', '')!r})"
+
     def _remember(self, ev_id: str) -> bool:
         """True when new. Bounded."""
         if ev_id in self.seen:
@@ -223,6 +234,7 @@ class BlueskyFeed:
         if not self.enabled:
             return
         backoff = 1
+        attempt = 0
         while True:
             await self.resolve()
             if not self.dids:
@@ -233,8 +245,10 @@ class BlueskyFeed:
                 await asyncio.sleep(60)
                 continue
             beat = None
+            host = JETSTREAM_HOSTS[attempt % len(JETSTREAM_HOSTS)]
+            attempt += 1
             try:
-                async with self.ws_connect(jetstream_url(list(self.dids)), max_size=2**22,
+                async with self.ws_connect(jetstream_url(list(self.dids), host), max_size=2**22,
                                            ping_interval=20, ping_timeout=30) as ws:
                     self._poll_backlog.clear()
                     self._set_state("ws", True)
@@ -257,7 +271,7 @@ class BlueskyFeed:
                 raise
             except Exception as exc:
                 print(f"bluesky socket down, polling getAuthorFeed every {POLL_S:.0f}s for "
-                      f"{FALLBACK_FOR_S / 60:.0f} min: {exc!r}")
+                      f"{FALLBACK_FOR_S / 60:.0f} min (host {host}): {self._close_info(exc)}")
             finally:
                 if beat:
                     beat.cancel()
@@ -265,6 +279,7 @@ class BlueskyFeed:
             self._set_state("poll", False)
             deadline = self.now() + FALLBACK_FOR_S
             while self.now() < deadline:
+                errors_before = self.st["errors"]
                 for did, handle in list(self.dids.items()):
                     try:
                         await self.poll_once(did, handle)
@@ -272,6 +287,10 @@ class BlueskyFeed:
                         raise
                     except Exception:
                         self.st["errors"] += 1
+                    # heartbeat after each handle so a slow failing round never looks stale
+                    self._set_state("poll", self.st["errors"] == errors_before)
+                # Heartbeat in poll mode too (every round, under HEARTBEAT_S apart): connected while polls succeed.
+                self._set_state("poll", self.st["errors"] == errors_before)
                 await asyncio.sleep(POLL_S)
             backoff = min(backoff * 2, 30)
             await asyncio.sleep(backoff)

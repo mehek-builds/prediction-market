@@ -39,8 +39,8 @@ news: 18 RSS feeds + SEC 8-K  |  X (10 handles via xAI x_search, 60 s)  |  Blues
 | `fastlane/kalshi_tape.py` | Live Kalshi quotes: price-at-publish-time, first reaction time, and the move detector. |
 | `fastlane/report.py` | Stage latencies, source lag, decisions, market moves after news, mark-to-bid P&L. |
 | `fastlane/bench_jev.py` | Standalone Jev benchmark. |
-| `fastlane/api.py` | Read-only FastAPI over the ledger (`GET` routes only). |
-| `fastlane/static/index.html` | Single-file dashboard served at `/`, no external requests. |
+| `fastlane/api.py` | Read-only FastAPI over the ledger (`GET` routes), plus one control route: `POST /settings/shadow` toggles shadow mode. |
+| `fastlane/static/index.html` | Single-file terminal dashboard served at `/` (light and dark, keyboard driven), no external requests. |
 
 ## Quick start
 
@@ -69,7 +69,7 @@ Environment variables (see `.env.example`):
 | `PAPER_DAILY_LOSS_HALT_PCT` | optional | Daily loss halt as a fraction of bankroll, default 0.05. |
 | `MAX_SPREAD_CENTS` | optional | Cost filter: skip a market whose held-side spread (ask minus bid) is over this many cents at decision. Default 3. |
 | `COST_TO_ROOM_MAX` | optional | Cost filter: skip when spread plus both taker fees exceed this fraction of the room to profit (1 minus entry). Default 0.25. |
-| `SHADOW_ENABLED` | optional | Record a shadow book of what a looser rule would have traded, default true. |
+| `SHADOW_ENABLED` | optional | Record a shadow book of what a looser rule would have traded, default true (the dashboard toggle, stored in the ledger, overrides this). |
 | `SHADOW_SIGNAL_THRESHOLD` | optional | Shadow rule signal threshold, default 0.60 (real rule: 0.85, unchanged). |
 | `SHADOW_DECISIVE_MIN` | optional | Shadow rule decisive minimum, default 0.0 (real rule: 0.30, unchanged). |
 | `XAI_API_KEY` | optional | xAI key. Enables the X poller; about $0.018 to $0.055 per call (measured). Off when empty. |
@@ -116,6 +116,27 @@ docker run -p 127.0.0.1:8787:8787 --env-file .env -v fastlane-results:/app/fastl
 
 `--env-file` cannot hold multi-line values, so put the Kalshi key body on one line or mount a key file.
 
+## Dashboard
+
+`python3 -m uvicorn fastlane.api:app --port 8787` serves one static page at `/`: no build step, no external requests.
+
+- Masthead: a persistent `PAPER` badge and status cells for the run state, the Kalshi tape, the feeds (X calls and
+  spend against the daily budget, Bluesky websocket or polling, feeds with events in the last hour), the shadow switch
+  and data age, plus ET and UTC clocks.
+- BOOKS: LIVE, SHADOW and TEST rows with a totals row for the real book.
+- BLOTTER: every trade, sortable by column header, as a table or as cards.
+- P&L 24H: mark-to-bid curve per book.
+- LATENCY: p50, p90 and last for match, Jev, book and total.
+- SHADOW BY SIGNAL: shadow P&L per signal-strength bucket.
+- NEWS / DECISIONS: every headline judged, with the verdict and how the market moved afterwards.
+
+Keys: `1` all, `2` live, `3` shadow, `4` test books; `B` table, `C` cards; `S` cycle sort; `H` toggle shadow mode;
+`T` toggle theme; `R` refresh; `?` help. Themes are TERMINAL (dark) and LEDGER (light). The page follows
+`prefers-color-scheme`; `T` overrides it and is stored in `localStorage` under `fastlane.theme`; `?theme=light|dark`
+is a one-shot override for screenshots. `GET /status` is read-only and derived from the ledger timestamps, so it says
+"last tick 12s ago", never "up" or "down". `GET /settings` reports the shadow switch and its source, and `/decisions`
+rows carry `shortlist_ms`, `book_ms` and `n_candidates`.
+
 ## Fast sources
 
 Why: on 5 stories covered by both, our RSS feeds saw the story a median of about 32 minutes after the first X post
@@ -125,13 +146,13 @@ and post text is treated as untrusted data (it is stored and shown as a headline
 query).
 
 **X via xAI.** Each poll is one Grok call with the `x_search` tool over the handle group: one `x_keyword_search`, at
-most about 10 posts, a few to 15 seconds (4 to 15 measured), about $0.018 to $0.055. `max_tool_calls: 1` stops Grok from opening threads at triple the
+most about 10 posts, typically 4 to 15 seconds, about $0.018 to $0.055. `max_tool_calls: 1` stops Grok from opening threads at triple the
 cost. A returned post is accepted only if its URL handle is in the allowed list, its snowflake id decodes to a time
 inside the poll window (Grok can answer from memory when the search is empty), and the id is new; rejections are
 counted. Calls happen only inside the active window (default Mon-Fri 09:00-16:30 New York) and under the daily
-budget, which is read from the ledger so a restart does not reset it. A full default window is 7.5 hours at 60 calls
-an hour, so a full default window is 450 calls: about $8 to $25 at the measured cost, so the $25 cap only binds at
-the high end; the window is the usual limit. The first poll of each window (and the first after a
+budget, which is read from the ledger so a restart does not reset it. At 60 calls an hour a full default window
+(7.5 hours) is 450 calls: about $8 to $25 at the measured cost. The $25 cap only binds at the high end; the window
+is the usual limit. The first poll of each window (and the first after a
 budget stop or a long backoff) is backlog: seen, never traded.
 
 **Bluesky.** Newsroom accounts over the keyless Jetstream firehose, own top-level posts only (replies and reposts are
@@ -198,7 +219,28 @@ market on the same event.
 
 The console line for a shadow fill names the shadow market, which can differ from the market the real decision considered.
 
-Where to see it: the dashboard Shadow tab (with the bucket strip), `/trades?book=shadow`, and the "Shadow vs real"
+### Turning shadow mode on and off
+
+- Press `H` on the dashboard (or click the `SHDW` cap). The masthead `SHADOW` cell shows ON (blue) or OFF.
+- Off stops new shadow evaluations only. Shadow trades already in the ledger stay visible, keep being marked, and
+  still count in the Shadow book and report.
+- The setting is stored in the ledger `settings` table and wins over `SHADOW_ENABLED`; the engine re-reads it every
+  2 s, no restart. Delete the row to fall back to the env variable:
+  `sqlite3 fastlane/results/ledger.db "DELETE FROM settings WHERE key='shadow_enabled'"`.
+- The route is `POST /settings/shadow` with body `{"enabled": true|false}` and headers `Content-Type:
+  application/json` and `X-Fastlane-Control: 1`. It is the API's only write and can only toggle shadow mode. The
+  custom header plus the JSON content type mean a cross-site page would need a CORS preflight, which the API does not
+  answer; the Host allow-list (`FASTLANE_ALLOWED_HOSTS`) still applies. There is no authentication beyond the
+  Host and header checks, so anyone who can reach an allowed Host (for example a LAN name added to
+  `FASTLANE_ALLOWED_HOSTS`) can flip the switch.
+
+  ```bash
+  curl -s -X POST localhost:8787/settings/shadow -H 'Content-Type: application/json' \
+    -H 'X-Fastlane-Control: 1' -d '{"enabled": false}'
+  ```
+- Paper only, as everything else: the switch starts or stops a paper experiment; nothing can be sent to an exchange.
+
+Where to see it: the dashboard key `3` (SHADOW BY SIGNAL), `/trades?book=shadow`, and the "Shadow vs real"
 section of `python3 -m fastlane.report`.
 
 How to act on it: loosen the real thresholds only if a bucket is profitable after costs over a meaningful sample.

@@ -3,6 +3,8 @@
     uvicorn fastlane.api:app --port 8787
 
 GET /trades  -> every paper trade with its trigger, decision timings, live sell price, P&L and price path since entry.
+GET /decisions, /status, /settings, /health -> read-only views of the ledger.
+POST /settings/shadow -> the only write: toggles shadow mode at runtime (see README).
 """
 import asyncio
 import json
@@ -14,13 +16,13 @@ from typing import Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from fastlane.books import fetch_book, taker_fee_per_contract
 from fastlane.decision import BUCKET_EDGES, strength_bucket
-from fastlane.ledger import DB_PATH, SCHEMA, columns, mark_key, utc_day
+from fastlane.ledger import DB_PATH, SCHEMA, SETTINGS_DDL, columns, mark_key, shadow_enabled_from, utc_day
 from fastlane.universe import CACHE
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -227,7 +229,7 @@ def _decisions(db: sqlite3.Connection, limit: int) -> dict:
                    "NULL AS shadow_action, NULL AS shadow_reason, NULL AS shadow_market_id")
     rows = db.execute(f"""
         SELECT e.id, e.headline, e.source, e.url, e.published_ts, e.seen_ts,
-               d.decided_ts, d.total_ms, d.jev_ms, d.action, d.reason, d.venue, d.market_id, d.market_question,
+               d.decided_ts, d.total_ms, d.jev_ms, d.shortlist_ms, d.book_ms, d.n_candidates, d.action, d.reason, d.venue, d.market_id, d.market_question,
                d.market_conf AS strength, d.p_up, d.p_down, d.materiality AS p_decisive, d.mid_at_decision,
                {shadow_cols}
         FROM events e JOIN decisions d ON d.event_id = e.id
@@ -259,7 +261,9 @@ def _decisions(db: sqlite3.Connection, limit: int) -> dict:
         out.append({
             "id": r["id"], "headline": r["headline"], "source": r["source"], "url": r["url"],
             "published_ts": r["published_ts"], "seen_ts": r["seen_ts"], "decided_ts": r["decided_ts"],
-            "total_ms": r["total_ms"], "jev_ms": r["jev_ms"], "action": r["action"], "reason": r["reason"],
+            "total_ms": r["total_ms"], "jev_ms": r["jev_ms"], "shortlist_ms": r["shortlist_ms"],
+            "book_ms": r["book_ms"], "n_candidates": r["n_candidates"],
+            "action": r["action"], "reason": r["reason"],
             "venue": r["venue"], "market_id": r["market_id"], "market_question": r["market_question"],
             "lean": None if not r["market_id"] else ("yes" if leaning_yes else "no"),
             "strength": r["strength"], "p_decisive": r["p_decisive"],
@@ -328,3 +332,105 @@ def _sources(db: sqlite3.Connection) -> dict:
         conn, ts, info = sb
         b.update(connected=conn, mode=info.get("mode"), updated_ts=ts)
     return {"x": x, "bluesky": b}
+
+
+@app.get("/status")
+async def status():
+    """Engine liveness as seen from the ledger. The API has no link to the running process, so every field is a
+    timestamp or a count the dashboard turns into "N ago"; it never claims up/down. The v0.3.0 `x` and `bluesky`
+    blocks of /health are repeated here so the masthead needs one call."""
+    db = _db()
+    try:
+        return _status(db)
+    finally:
+        db.close()
+
+
+def _status(db: sqlite3.Connection) -> dict:
+    now = time.time()
+    hour = now - 3600
+
+    def one(sql: str, *args):
+        r = db.execute(sql, args).fetchone()
+        return r[0], int(r[1] or 0)
+
+    last_event, events_1h = one("SELECT MAX(seen_ts), SUM(seen_ts > ?) FROM events WHERE synthetic = 0", hour)
+    last_decision, decisions_1h = one(
+        "SELECT MAX(d.decided_ts), SUM(d.decided_ts > ?) FROM decisions d JOIN events e ON e.id = d.event_id "
+        "WHERE e.synthetic = 0", hour)
+    last_trade = db.execute("SELECT MAX(opened_ts) FROM trades WHERE synthetic = 0").fetchone()[0]
+    last_tick, ticks_1h = one("SELECT MAX(ts), SUM(ts > ?) FROM ticks", hour)
+    sources = [{"source": r[0], "last_seen_ts": r[1], "events_1h": int(r[2] or 0)} for r in db.execute(
+        "SELECT source, MAX(seen_ts), SUM(seen_ts > ?) FROM events WHERE synthetic = 0 GROUP BY source "
+        "ORDER BY 2 DESC", (hour,))]
+    x = _sources(db)
+    budget = None
+    try:
+        row = db.execute("SELECT info FROM feed_status WHERE name = 'x'").fetchone()
+        info = json.loads(row[0] or "{}") if row else {}
+        if isinstance(info, dict) and isinstance(info.get("budget_usd"), (int, float)):
+            budget = float(info["budget_usd"])
+    except (sqlite3.OperationalError, ValueError):
+        pass
+    x["x"]["budget_usd"] = budget      # None until the engine has written a heartbeat that carries it
+    return {"now": now, "ledger": DB_PATH.exists(),
+            "last_event_ts": last_event, "last_decision_ts": last_decision, "last_trade_ts": last_trade,
+            "last_tick_ts": last_tick, "events_1h": events_1h, "decisions_1h": decisions_1h, "ticks_1h": ticks_1h,
+            "sources": sources, **x}
+
+
+@app.get("/settings")
+async def settings():
+    """Current runtime settings and where each comes from. Only shadow mode is settable (POST /settings/shadow)."""
+    db = _db()
+    try:
+        enabled, source = shadow_enabled_from(db)
+    except sqlite3.OperationalError:   # locked / busy: transient, the dashboard keeps its previous settings
+        return JSONResponse({"detail": "ledger busy, try again"}, status_code=503)
+    finally:
+        db.close()
+    return {"shadow_enabled": enabled, "source": source}
+
+
+CONTROL_HEADER = "x-fastlane-control"   # custom header: a cross-site page cannot send it without a CORS preflight,
+                                        # and there is no CORS middleware, so the preflight fails
+MAX_CONTROL_BODY = 256
+
+
+@app.post("/settings/shadow")
+async def set_shadow(request: Request):
+    """The API's only write. Toggles shadow mode at runtime (the engine re-reads within 2 s). Paper only: this
+    switches a paper-trade experiment on and off; it cannot place, size or route anything."""
+    if request.headers.get(CONTROL_HEADER) != "1":
+        return JSONResponse({"detail": "missing X-Fastlane-Control: 1"}, status_code=403)
+    if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
+        return JSONResponse({"detail": "Content-Type must be application/json"}, status_code=415)
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > MAX_CONTROL_BODY:   # reject before reading the body
+        return JSONResponse({"detail": "body too large"}, status_code=413)
+    body = await request.body()
+    if len(body) > MAX_CONTROL_BODY:
+        return JSONResponse({"detail": "body too large"}, status_code=413)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return JSONResponse({"detail": "body is not JSON"}, status_code=400)
+    if not (isinstance(data, dict) and set(data) == {"enabled"} and isinstance(data["enabled"], bool)):
+        return JSONResponse({"detail": 'body must be exactly {"enabled": true|false}'}, status_code=400)
+    if not DB_PATH.exists():
+        return JSONResponse({"detail": "no ledger yet: start the engine once"}, status_code=503)
+    db = sqlite3.connect(str(DB_PATH), timeout=2.0, isolation_level=None)   # busy_timeout 2 s: the engine writes in WAL
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(SETTINGS_DDL)
+        db.execute("INSERT OR REPLACE INTO settings (key, value, updated_ts) VALUES ('shadow_enabled', ?, ?)",
+                   ("1" if data["enabled"] else "0", time.time()))
+        db.execute("COMMIT")
+    except sqlite3.OperationalError as exc:        # locked past the timeout
+        return JSONResponse({"detail": f"ledger busy: {exc}"}, status_code=503)
+    finally:
+        db.close()
+    return {"shadow_enabled": data["enabled"], "source": "ledger"}

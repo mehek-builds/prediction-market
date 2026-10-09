@@ -36,6 +36,11 @@ def test_mutating_http_only_in_jev_and_xai_clients():
                 assert not re.search(r"kalshi|polymarket", text, re.I)
             else:   # x_feed.py lists the public Polymarket X handle, so check for exchange hosts instead of the word
                 assert not re.search(r"kalshi|polymarket\.com|clob\.", text, re.I)
+        elif f.name == "api.py":   # the one control route: POST /settings/shadow (paper-only shadow toggle)
+            assert text.count(".post(") == 1 and re.search(r'^@app\.post\("/settings/shadow"\)$', text, re.M)
+            assert not re.search(r"\.(put|delete|patch|request)\(", text)
+            assert not re.search(r"(?<!ws)\.send\(", text)
+            assert not re.search(r"[\"']POST[\"']|method\s*=\s*[\"']POST", text)
         else:
             assert not re.search(r"(?<!queue)\.(post|put|delete|patch|request)\(", text), f.name
             assert not re.search(r"(?<!ws)\.send\(", text), f.name        # client.send(httpx.Request("POST", ...))
@@ -52,6 +57,9 @@ def test_kalshi_module_does_not_import_httpx():
     assert not re.search(r"^\s*(import|from)\s+httpx", (ROOT / "fastlane/kalshi.py").read_text(), re.M)
 
 
-def test_api_routes_are_get_only():
-    decorators = re.findall(r"^@app\.(\w+)\(", (ROOT / "fastlane/api.py").read_text(), re.M)
-    assert decorators and set(decorators) == {"get"}
+def test_api_routes_are_get_except_shadow_toggle():
+    text = (ROOT / "fastlane/api.py").read_text()
+    routes = re.findall(r'^@app\.(\w+)\("([^"]+)"', text, re.M)
+    assert routes and all(m == "get" for m, p in routes if p != "/settings/shadow")
+    assert [p for m, p in routes if m != "get"] == ["/settings/shadow"]
+    assert [m for m, p in routes if p == "/settings/shadow"] == ["post"]

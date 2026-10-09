@@ -573,3 +573,131 @@ def test_finish_line_fits_long_source(eng, capsys):
     eng.verbose = True
     _run(eng, _event(source="bsky:washingtonpost.com"))
     assert "[bsky:washingtonpost.]" in capsys.readouterr().out
+
+
+# ---------- v0.4.0: runtime shadow toggle ----------
+def test_shadow_toggle_at_runtime_without_restart(eng):
+    e = eng
+    e.jev = FakeJev(_answers_for(probs=LEAN))
+    assert e.shadow_enabled is True
+    e.ledger.set_setting("shadow_enabled", "0"); e._shadow_checked_ts = 0.0     # force the 2 s cache to expire
+    rec = _run(e, _event(id="ev-off"))
+    assert e.shadow_enabled is False and "shadow_action" not in rec and _trades(e) == []
+    e.ledger.set_setting("shadow_enabled", "1"); e._shadow_checked_ts = 0.0
+    rec = _run(e, _event(id="ev-on"))
+    assert rec["shadow_reason"] == "signal_yes" and _trades(e) == [("AVNT-1", "yes", 1)]
+
+
+def test_shadow_off_records_no_shadow_columns_or_real_signalled_row(eng):
+    e = eng
+    e.ledger.set_setting("shadow_enabled", "0"); e._shadow_checked_ts = 0.0
+    rec = _run(e, _event())                       # default answers pass the real rule: a real fill, no shadow row
+    assert rec["reason"] == "signal_yes" and _trades(e) == [("AVNT-1", "yes", 0)]
+    assert e.ledger.db.execute("SELECT shadow_action, shadow_reason, shadow_market_id FROM decisions").fetchone() == (None, None, None)
+
+
+def test_shadow_setting_row_beats_env(monkeypatch, tmp_path, tiny_universe):
+    monkeypatch.setenv("SHADOW_ENABLED", "false")
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe)
+    assert e.shadow_enabled is False
+    e.ledger.set_setting("shadow_enabled", "1"); e._shadow_checked_ts = 0.0
+    assert e.shadow_enabled is True
+
+
+def test_shadow_setting_is_cached(eng):
+    assert eng.shadow_enabled is True
+    eng.ledger.set_setting("shadow_enabled", "0")
+    assert eng.shadow_enabled is True          # within the 2 s window the cached value is served
+    eng._shadow_checked_ts = 0.0
+    assert eng.shadow_enabled is False
+
+
+def test_shadow_setting_cache_expires_after_window(eng, monkeypatch):
+    t = [1000.0]
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: t[0])
+    eng._shadow_checked_ts = 0.0
+    assert eng.shadow_enabled is True
+    eng.ledger.set_setting("shadow_enabled", "0")
+    t[0] += 1.9
+    assert eng.shadow_enabled is True
+    t[0] += 0.2                                # 2.1 s after the read
+    assert eng.shadow_enabled is False
+
+
+def test_real_decision_is_recorded_before_any_setting_read(eng, monkeypatch):
+    """The real path never waits on the shadow switch: the decision row exists when the setting is first read."""
+    seen = []
+    real = engine_mod.shadow_enabled_from
+
+    def spy(db):
+        seen.append(db.execute("SELECT action, reason FROM decisions WHERE event_id = 'ev1'").fetchone())
+        return real(db)
+
+    monkeypatch.setattr(engine_mod, "shadow_enabled_from", spy)
+    eng._shadow_checked_ts = 0.0
+    eng.jev = FakeJev(_answers_for(probs=LEAN))
+    _run(eng, _event())
+    assert seen and all(s is not None for s in seen)
+
+
+def test_real_path_unaffected_when_setting_read_fails(eng, monkeypatch):
+    """Even a broken settings read (here: raising) cannot undo a real fill that is already recorded."""
+    def boom(db):
+        raise RuntimeError("settings unreadable")
+
+    monkeypatch.setattr(engine_mod, "shadow_enabled_from", boom)
+    eng._shadow_checked_ts = 0.0
+    try:
+        _run(eng, _event())
+    except RuntimeError:
+        pass
+    assert ("AVNT-1", "yes", 0) in _trades(eng)
+
+
+def test_status_line_reports_shadow_mode(eng):
+    assert "shadow mode on" in eng.status()
+    eng.ledger.set_setting("shadow_enabled", "0"); eng._shadow_checked_ts = 0.0
+    assert "shadow mode off" in eng.status()
+
+
+def test_start_writes_x_disabled_status_when_x_is_off(eng, monkeypatch):
+    """Leftover fix: with no XAI key the heartbeat row says {"enabled": false}, never stale from an older run."""
+    eng.ledger.feed_status_set("x", True, {"enabled": True, "calls_today": 9})    # left over from an earlier run
+    assert eng.xfeed.enabled is False
+
+    async def noload(client, force=False):
+        return "cache"
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(eng.universe, "load", noload)
+    monkeypatch.setattr(eng, "_keepwarm_once", noop)
+    monkeypatch.setattr(eng, "_index_kalshi", lambda: None)
+    monkeypatch.setattr(eng.hub, "tasks", lambda: [])
+    monkeypatch.setattr(eng.bsky, "run", noop)
+    monkeypatch.setattr(eng, "_worker", noop)
+    monkeypatch.setattr(eng, "_keepwarm_loop", noop)
+    monkeypatch.setattr(eng, "_refresh_universe_loop", noop)
+
+    async def go():
+        await eng.start(feeds=True)
+        await asyncio.gather(*eng._tasks, return_exceptions=True)
+        await eng.http.aclose()
+    asyncio.run(go())
+    st = eng.ledger.feed_status("x")
+    assert st["connected"] is False and st["info"] == {"enabled": False}
+
+
+def test_transient_setting_read_error_keeps_previous_value(eng, monkeypatch):
+    import sqlite3
+    eng.ledger.set_setting("shadow_enabled", "0")
+    eng._shadow_checked_ts = 0.0
+    assert eng.shadow_enabled is False
+
+    def locked(db):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(engine_mod, "shadow_enabled_from", locked)
+    eng._shadow_checked_ts = 0.0
+    assert eng.shadow_enabled is False         # previous cached value, not the env default

@@ -260,3 +260,219 @@ def test_health_x_budget_hit_flag(seeded):
     c, L, _ = seeded
     L.feed_status_set("x", False, {"enabled": True, "budget_hit": True, "in_window": True})
     assert c.get("/health").json()["x"]["budget_hit"] is True
+
+
+# ---------- v0.4.0: stage timings, /status, /settings, shadow toggle ----------
+def test_decisions_carry_stage_timings(seeded):
+    c, L, now = seeded
+    L.db.execute("UPDATE decisions SET shortlist_ms = 12, book_ms = 34, n_candidates = 5 WHERE event_id = 'e1'")
+    by = {x["id"]: x for x in c.get("/decisions").json()["decisions"]}
+    assert set(by["e1"]) >= {"shortlist_ms", "book_ms", "n_candidates"}
+    assert (by["e1"]["shortlist_ms"], by["e1"]["book_ms"], by["e1"]["n_candidates"]) == (12, 34, 5)
+    assert by["e1"]["jev_ms"] == 300            # existing fields untouched
+    assert by["e4"]["book_ms"] is None          # unset timings stay null, never raise
+
+
+def test_status(seeded):
+    c, L, now = seeded
+    L.tick("MK1", now - 5, .40, .42)
+    s = c.get("/status").json()
+    assert s["ledger"] is True and s["now"] == pytest.approx(now, abs=5)
+    assert s["last_event_ts"] == pytest.approx(now - 30, abs=1)      # e4; synthetic e2 excluded
+    assert s["last_decision_ts"] == pytest.approx(now - 30, abs=1)
+    assert s["last_trade_ts"] == pytest.approx(now - 30, abs=1)      # shadow trade counts as engine activity
+    assert s["last_tick_ts"] == pytest.approx(now - 5, abs=1) and s["ticks_1h"] == 1
+    assert s["events_1h"] == 2 and s["decisions_1h"] == 2
+    assert [x["source"] for x in s["sources"]] == ["cnbc"] and s["sources"][0]["events_1h"] == 2
+    assert s["sources"][0]["last_seen_ts"] == pytest.approx(now - 30, abs=1)
+
+
+def test_status_counts_only_the_last_hour(seeded):
+    c, L, now = seeded
+    L.tick("MK1", now - 7200, .40, .42)
+    L.event({"id": "old", "source": "reuters", "headline": "Yesterday", "seen_ts": now - 7200})
+    s = c.get("/status").json()
+    assert s["ticks_1h"] == 0 and s["last_tick_ts"] == pytest.approx(now - 7200, abs=1)
+    by = {x["source"]: x for x in s["sources"]}
+    assert by["reuters"]["events_1h"] == 0 and by["cnbc"]["events_1h"] == 2
+    assert s["sources"][0]["source"] == "cnbc"          # newest first
+
+
+def test_status_carries_x_and_bluesky_blocks(seeded):
+    c, L, now = seeded
+    s = c.get("/status").json()
+    assert s["x"]["enabled"] is False and s["x"]["budget_usd"] is None and s["bluesky"]["connected"] is False
+    L.feed_status_set("x", True, {"enabled": True, "budget_hit": False, "in_window": True, "calls_today": 3,
+                                  "spend_today_usd": .18, "budget_usd": 5.0})
+    L.feed_status_set("bsky", True, {"mode": "poll"})
+    s = c.get("/status").json()
+    assert s["x"]["enabled"] is True and s["x"]["budget_usd"] == 5.0 and s["x"]["in_window"] is True
+    assert s["bluesky"]["connected"] is True and s["bluesky"]["mode"] == "poll"
+    h = c.get("/health").json()
+    assert h["x"]["enabled"] is True and h["bluesky"]["mode"] == "poll"     # /health untouched by the repeat
+
+
+def test_status_x_disabled_row(seeded):
+    c, L, _ = seeded
+    L.feed_status_set("x", False, {"enabled": False})
+    s = c.get("/status").json()
+    assert s["x"]["enabled"] is False and s["x"]["budget_usd"] is None
+
+
+def test_status_missing_ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr(api, "DB_PATH", tmp_path / "absent.db")
+    monkeypatch.setattr(api, "CACHE", tmp_path / "none.json")
+    s = TestClient(api.app).get("/status").json()
+    assert s["ledger"] is False and s["last_event_ts"] is None and s["events_1h"] == 0 and s["sources"] == []
+    assert s["decisions_1h"] == 0 and s["ticks_1h"] == 0 and s["last_trade_ts"] is None and s["last_tick_ts"] is None
+    assert not (tmp_path / "absent.db").exists()
+
+
+def test_status_on_old_schema_ledger(old_ledger_path, monkeypatch, tmp_path):
+    """v0.1.1 file: no feed_status, x_spend, settings, ticks_ts index. Must serve, never 500, never write."""
+    monkeypatch.setattr(api, "DB_PATH", old_ledger_path)
+    monkeypatch.setattr(api, "CACHE", tmp_path / "none.json")
+    r = TestClient(api.app).get("/status")
+    assert r.status_code == 200
+    s = r.json()
+    assert s["ledger"] is True and s["last_event_ts"] == 905.0 and s["last_decision_ts"] == 906.0
+    assert s["last_trade_ts"] == 906.0 and s["last_tick_ts"] is None
+    assert s["events_1h"] == 0 and s["ticks_1h"] == 0
+    assert [x["source"] for x in s["sources"]] == ["cnbc"]
+    assert s["x"]["enabled"] is False and s["bluesky"]["connected"] is False
+    import sqlite3
+    names = {r[0] for r in sqlite3.connect(old_ledger_path).execute("SELECT name FROM sqlite_master")}
+    assert "settings" not in names and "ticks_ts" not in names         # GET never migrates
+
+
+def test_health_keeps_ok_and_ledger_keys(seeded):
+    c, _, _ = seeded
+    h = c.get("/health").json()
+    assert h["ok"] is True and h["ledger"] is True      # v0.3.0 added x and bluesky; the originals keep meaning
+
+
+CTRL = {"X-Fastlane-Control": "1"}
+
+
+def test_settings_get_env_fallback(seeded, monkeypatch):
+    c, _, _ = seeded
+    assert c.get("/settings").json() == {"shadow_enabled": True, "source": "env"}
+    monkeypatch.setenv("SHADOW_ENABLED", "false")
+    assert c.get("/settings").json() == {"shadow_enabled": False, "source": "env"}
+
+
+def test_shadow_toggle_persists_and_wins_over_env(seeded, monkeypatch):
+    c, L, _ = seeded
+    monkeypatch.setenv("SHADOW_ENABLED", "false")
+    r = c.post("/settings/shadow", json={"enabled": True}, headers=CTRL)
+    assert r.status_code == 200 and r.json() == {"shadow_enabled": True, "source": "ledger"}
+    assert c.get("/settings").json() == {"shadow_enabled": True, "source": "ledger"}
+    assert L.get_setting("shadow_enabled") == "1"                      # visible on the engine's connection
+    r = c.post("/settings/shadow", json={"enabled": False}, headers=CTRL)
+    assert r.json()["shadow_enabled"] is False and L.get_setting("shadow_enabled") == "0"
+    r = c.post("/settings/shadow", json={"enabled": False}, headers={**CTRL, "Content-Type": "application/json; charset=utf-8"})
+    assert r.status_code == 200                                         # charset parameter is accepted
+
+
+def test_shadow_toggle_rejects_bad_requests(seeded):
+    c, _, _ = seeded
+    assert c.post("/settings/shadow", json={"enabled": True}).status_code == 403                       # no header
+    assert c.post("/settings/shadow", json={"enabled": True}, headers={"X-Fastlane-Control": "yes"}).status_code == 403
+    assert c.post("/settings/shadow", content='{"enabled": true}', headers={**CTRL, "Content-Type": "text/plain"}).status_code == 415
+    assert c.post("/settings/shadow", content="enabled=true", headers={**CTRL, "Content-Type": "application/x-www-form-urlencoded"}).status_code == 415
+    assert c.post("/settings/shadow", content="{not json", headers={**CTRL, "Content-Type": "application/json"}).status_code == 400
+    assert c.post("/settings/shadow", json={"enabled": "yes"}, headers=CTRL).status_code == 400          # not a bool
+    assert c.post("/settings/shadow", json={"enabled": 1}, headers=CTRL).status_code == 400              # int is not a bool
+    assert c.post("/settings/shadow", json={"enabled": None}, headers=CTRL).status_code == 400
+    assert c.post("/settings/shadow", json=[True], headers=CTRL).status_code == 400                      # not an object
+    assert c.post("/settings/shadow", json={}, headers=CTRL).status_code == 400
+    assert c.post("/settings/shadow", json={"enabled": True, "other": 1}, headers=CTRL).status_code == 400   # extra keys
+    assert c.post("/settings/shadow", json={"shadow_signal_threshold": .5}, headers=CTRL).status_code == 400  # only shadow
+    assert c.post("/settings/shadow", json={"enabled": True}, headers={**CTRL, "host": "evil.example.net"}).status_code == 400
+    assert c.get("/settings").json()["source"] == "env"                 # nothing above wrote anything
+
+
+def test_shadow_toggle_rejects_large_content_length_first(seeded, monkeypatch):
+    from starlette.requests import Request
+    c, _, _ = seeded
+    reads = []
+
+    async def tripwire(self, *a, **k):
+        reads.append(1)
+        raise AssertionError("request body was consumed before the 413")
+
+    def tripwire_stream(self):
+        reads.append(1)
+        raise AssertionError("request body was consumed before the 413")
+    monkeypatch.setattr(Request, "body", tripwire)
+    monkeypatch.setattr(Request, "stream", tripwire_stream)
+    r = c.post("/settings/shadow", content=b"x" * 1000, headers={**CTRL, "Content-Type": "application/json"})
+    assert r.status_code == 413 and reads == []
+    monkeypatch.undo()
+    assert c.get("/settings").json()["source"] == "env"
+
+
+def test_settings_returns_503_on_transient_db_error(seeded, monkeypatch):
+    import sqlite3 as _sq
+    c, _, _ = seeded
+
+    def locked(db):
+        raise _sq.OperationalError("database is locked")
+    monkeypatch.setattr(api, "shadow_enabled_from", locked)
+    r = c.get("/settings")
+    assert r.status_code == 503 and "busy" in r.json()["detail"]
+
+
+def test_shadow_toggle_rejects_large_body(seeded):
+    c, _, _ = seeded
+    big = '{"enabled": true, "pad": "' + "x" * 400 + '"}'
+    r = c.post("/settings/shadow", content=big, headers={**CTRL, "Content-Type": "application/json"})
+    assert r.status_code == 413
+    assert c.get("/settings").json()["source"] == "env"
+
+
+def test_shadow_toggle_checks_run_in_order(seeded):
+    """Header is checked before content type, content type before body: a bad request leaks nothing about the rest."""
+    c, _, _ = seeded
+    r = c.post("/settings/shadow", content="x" * 1000, headers={"Content-Type": "text/plain"})
+    assert r.status_code == 403
+    r = c.post("/settings/shadow", content="x" * 1000, headers={**CTRL, "Content-Type": "text/plain"})
+    assert r.status_code == 415
+
+
+def test_shadow_toggle_has_no_cors_and_preflight_fails(seeded):
+    c, _, _ = seeded
+    r = c.options("/settings/shadow", headers={"Origin": "http://evil.example", "Access-Control-Request-Method": "POST",
+                                               "Access-Control-Request-Headers": "x-fastlane-control,content-type"})
+    assert r.status_code in (400, 404, 405) and "access-control-allow-origin" not in r.headers
+    r = c.post("/settings/shadow", json={"enabled": True}, headers={**CTRL, "Origin": "http://evil.example"})
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_shadow_toggle_without_ledger_is_503(tmp_path, monkeypatch):
+    monkeypatch.setattr(api, "DB_PATH", tmp_path / "absent.db")
+    monkeypatch.setattr(api, "CACHE", tmp_path / "none.json")
+    c = TestClient(api.app)
+    r = c.post("/settings/shadow", json={"enabled": False}, headers=CTRL)
+    assert r.status_code == 503 and "no ledger" in r.json()["detail"]
+    assert not (tmp_path / "absent.db").exists()                        # the API never creates the ledger
+    assert c.get("/settings").json() == {"shadow_enabled": True, "source": "env"}
+
+
+def test_shadow_toggle_on_old_schema_ledger(old_ledger_path, monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "DB_PATH", old_ledger_path)
+    monkeypatch.setattr(api, "CACHE", tmp_path / "none.json")
+    c = TestClient(api.app)
+    assert c.get("/settings").json()["source"] == "env"                 # no settings table yet: must not 500
+    assert c.post("/settings/shadow", json={"enabled": False}, headers=CTRL).status_code == 200
+    assert c.get("/settings").json() == {"shadow_enabled": False, "source": "ledger"}
+    assert c.get("/trades").status_code == 200                          # read paths unaffected
+
+
+def test_other_routes_still_reject_post(seeded):
+    c, _, _ = seeded
+    for path in ("/trades", "/decisions", "/status", "/settings", "/health"):
+        assert c.post(path, json={}, headers=CTRL).status_code == 405, path
+    for verb in ("put", "delete", "patch"):
+        assert c.request(verb.upper(), "/settings/shadow", json={"enabled": True}, headers=CTRL).status_code == 405, verb
+    assert c.get("/settings/shadow").status_code == 405

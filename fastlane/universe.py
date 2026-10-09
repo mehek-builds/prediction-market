@@ -22,6 +22,30 @@ MENTION_RE = re.compile(r"^what will .{1,80}? say\b", re.I)
 # Short-cycle markets (15-minute crypto/commodity targets, "up or down") reprice constantly by design: their moves are
 # not news, and RSS-speed news can never beat their expiry.
 SHORT_CYCLE_RE = re.compile(r"\b15 min|\bup or down\b", re.I)
+# Sports lines (Kalshi Sports is skipped by category; Polymarket has no such category in the gamma payload, so use its
+# per-market sports fields, then the typical question formats). Every question-text branch is gated by (?!will\b):
+# "Will ..." questions are never game lines (gamma's sportsMarketType/gameId catch real "Will" game markets).
+# Period tokens (1H, 2H, Q1-Q4) count only when ADJACENT to a line word ("Q4 Moneyline", "1H Spread", "Moneyline Q4",
+# "Warriors Q3 total"), so quarter-dated earnings/GDP/delivery markets are kept. A "vs" title counts only when it has no
+# question mark AND both sides look like competitor names: any comparison/topic word (which, who, performs, better,
+# debate, poll, a year such as 2026, ...) means it is a question about something else, not a game line.
+_PERIOD = r"(?:1H|2H|Q[1-4])"
+_LINE_WORD = r"(?:spread|moneyline|total|o/u|winner)"
+SPORTS_Q_RE = re.compile(
+    r"^(?!will\b)(?:"
+    r"(?:spread|moneyline)\b"
+    r"|total (?:points|goals|runs|kills|maps)\b"
+    r"|.*?\bO/U\s*\d"
+    r"|.*?\bmoneyline\b"
+    r"|.*?\btotal (?:points|goals|runs|kills|maps)\b"
+    r"|.*?\b" + _PERIOD + r"\s+" + _LINE_WORD + r"\b(?!\s+[a-z])"
+    r"|.*?\b" + _LINE_WORD + r"\s*[:\-]?\s*" + _PERIOD + r"\b"
+    r")", re.I)
+VS_RE = re.compile(r"^(?!will\b)[^?]{2,100}?\bvs\.?(?=\s)[^?]*$", re.I)
+NOT_A_GAME_RE = re.compile(
+    r"\b(?:which|who|whom|whose|what|how|why|when|performs?|performance|better|best|worse|worst|higher|lower|"
+    r"debate|polls?|polling|election|rematch|margin|vote|20\d\d|exceed|outperform\w*)\b",
+    re.I)
 MAX_MARKETS_PER_EVENT = 25
 POLY_PAGE = 100  # gamma caps a page at 100
 POLY_PAGES = 21  # gamma rejects offsets past 2,100
@@ -36,6 +60,14 @@ april june july august september october november december inc corp corporation 
 filer live updates update report reports reported price prices market markets stock stocks share shares percent
 prediction repriced within seconds just
 """.split())
+
+
+def is_sports_market(m: dict) -> bool:
+    """Polymarket sports market: gamma's sportsMarketType / gameId when present, else the question format."""
+    if m.get("sportsMarketType") or m.get("gameId"):
+        return True
+    q = m.get("question") or ""
+    return bool(SPORTS_Q_RE.search(q) or (VS_RE.search(q) and not NOT_A_GAME_RE.search(q)))
 
 
 def tokens(text: str) -> list[str]:
@@ -54,7 +86,8 @@ class Universe:
     # ---------- loading ----------
     async def load(self, client: httpx.AsyncClient, force: bool = False):
         if not force and CACHE.exists() and time.time() - CACHE.stat().st_mtime < CACHE_MAX_AGE_S:
-            self._set(json.loads(CACHE.read_text()))
+            cached = json.loads(CACHE.read_text())   # drop sports lines cached by an older version (format is unchanged)
+            self._set([m for m in cached if m.get("venue") != "polymarket" or not is_sports_market(m)])
             self.snapshot_ts = CACHE.stat().st_mtime
             return "cache"
         kalshi, poly = await asyncio.gather(self._kalshi(client), self._poly(client))
@@ -114,7 +147,7 @@ class Universe:
                 batch = r.json()
                 for m in batch:
                     toks = json.loads(m.get("clobTokenIds") or "[]")
-                    if len(toks) != 2 or not m.get("enableOrderBook", True):
+                    if len(toks) != 2 or not m.get("enableOrderBook", True) or is_sports_market(m):
                         continue
                     out.append({
                         "venue": "polymarket", "id": str(m["id"]), "question": m.get("question", ""),
