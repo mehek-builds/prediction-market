@@ -1,1 +1,2 @@
-"""Fast lane: news-to-decision pipeline for prediction markets. Paper trading only."""
+"""Fast lane: news-to-decision pipeline for prediction markets. Paper trading by default."""
+__version__ = "0.4.0"

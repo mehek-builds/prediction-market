@@ -1,6 +1,9 @@
 """Fast-lane engine: news event -> shortlist -> Jev decision (book prefetched in parallel) -> paper fill -> marks.
 
-Paper only. Nothing here can place a real order: there is no order endpoint anywhere in this module.
+Paper by default. The only path to a real order is `self.live` (fastlane/live.py), and it stays closed unless the
+user enabled real trading in .env AND flipped the dashboard switch for this engine session.
+Shadow mode is a runtime switch read from the ledger (`Engine.shadow_enabled`, cached 2 s) and never touches the
+real or the live path.
 """
 import asyncio
 import os
@@ -9,14 +12,18 @@ import time
 
 import httpx
 
+from fastlane import backup, errors, live
 from fastlane.bluesky import BlueskyFeed
 from fastlane.books import COST_BLOCK_REASONS, cost_block, fetch_book, simulate_fill
+from fastlane.config import KALSHI_PROD_BASE, kalshi_api_url, kalshi_base_url
 from fastlane.decision import build_request, cost_settings, decide, shadow_settings
 from fastlane.feeds import FeedHub
 from fastlane.jev_client import JevClient
 from fastlane.kalshi import KalshiClient
 from fastlane.kalshi_tape import KalshiTape, move_deny_re
 from fastlane.ledger import Ledger, mark_key, shadow_enabled_from
+from fastlane.live import LiveTrader
+from fastlane.ratelimit import JevBudget, env_float
 from fastlane.universe import Universe
 from fastlane.x_feed import XFeed
 
@@ -26,6 +33,8 @@ KEEPWARM_EVERY_S = 3        # upstreams drop idle connections after ~5 s; a cold
 UNIVERSE_REFRESH_S = 15 * 60
 MAX_NEWS_AGE_S = 600        # news first seen >10 min after publication is logged, never traded
 PRICED_IN_MOVE = 0.03       # skip if the market already moved >=3c our way between publication and decision
+HEARTBEAT_EVERY_S = 15      # engine_state.json: the dashboard only offers the real-money switch to a live engine
+BALANCE_EVERY_S = 300
 
 
 def freshness_block(ev: dict, mid_at_published: float | None, mid_now: float | None, side: str) -> str | None:
@@ -74,6 +83,9 @@ class Engine:
         self.kalshi_ids: set[str] = set()
         self.by_id: dict[str, dict] = {}
         self.kalshi = KalshiClient()
+        self.budget = JevBudget(self.ledger)
+        self.live = LiveTrader(self.ledger, self.kalshi, self.http)
+        self.live_orders = 0
         self.tape_enabled = self.kalshi.configured
         self.tape = KalshiTape(self.ledger, universe_ids=lambda: self.kalshi_ids,
                                market_info=self.by_id.get, on_move=self._on_move,
@@ -104,6 +116,9 @@ class Engine:
     # ---------- lifecycle ----------
     async def start(self, feeds: bool = True):
         t0 = time.perf_counter()
+        base = kalshi_base_url()   # raises on a bad KALSHI_BASE_URL before anything is signed or sent
+        if base != KALSHI_PROD_BASE:
+            print(f"warning: Kalshi calls go to {base}, not production")
         async with httpx.AsyncClient(http2=True, timeout=30) as c:
             src = await self.universe.load(c)
         print(f"universe: {len(self.universe.markets):,} markets from {src} in {time.perf_counter() - t0:.1f}s")
@@ -115,12 +130,19 @@ class Engine:
             print("warning: no Kalshi API key, live tape disabled (no move detector, no price-at-publish, "
                   "no priced-in guard). Public Kalshi market data still works.")
         self._index_kalshi()
+        self.live.start()   # new session, mode reset to paper: real trading never survives a restart
+        if self.live.enabled:
+            print("real trading: ENABLED in .env, but this session starts on PAPER. Flip the dashboard switch to go "
+                  "real." if self.kalshi.configured else
+                  "warning: LIVE_TRADING_ENABLED=1 but no Kalshi API key; real trading is unavailable")
         if self.tape_enabled:
             self._tasks.append(asyncio.create_task(self.tape.run()))
         await self._keepwarm_once()
         self._tasks += [asyncio.create_task(self._worker()) for _ in range(self.workers)]
         self._tasks.append(asyncio.create_task(self._keepwarm_loop()))
         self._tasks.append(asyncio.create_task(self._refresh_universe_loop()))
+        self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
+        self._tasks.append(asyncio.create_task(self._backup_loop()))
         if feeds:
             feed_tasks = self.hub.tasks()
             self._tasks += feed_tasks
@@ -140,21 +162,29 @@ class Engine:
                 print("bluesky off (BSKY_ENABLED=false)")
 
     async def stop(self):
+        self.live.stop()
         pending = self._tasks + list(self._bg)
         for t in pending:
             t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-        await self.hub.aclose()
-        await self.xfeed.aclose()
-        await self.bsky.aclose()
-        await self.jev.aclose()
-        await self.http.aclose()
+        # Each close is independent: one failing must not skip the others or the shutdown backup below.
+        for name, closer in (("hub", self.hub.aclose), ("xfeed", self.xfeed.aclose), ("bsky", self.bsky.aclose),
+                             ("jev", self.jev.aclose), ("http", self.http.aclose)):
+            try:
+                await closer()
+            except Exception as exc:
+                errors.capture(exc, f"engine.stop.{name}")
+        try:
+            if self._backs_up():
+                await asyncio.to_thread(backup.backup, self.ledger.path)
+        except Exception as exc:
+            errors.capture(exc, "backup.shutdown")
 
     async def _keepwarm_once(self):
         t0 = time.perf_counter()
         await asyncio.gather(
             self.jev.keepalive(),
-            self.http.get("https://api.elections.kalshi.com/trade-api/v2/exchange/status"),
+            self.http.get(kalshi_api_url() + "/exchange/status"),
             self.http.get("https://clob.polymarket.com/time"),
             return_exceptions=True)
         return (time.perf_counter() - t0) * 1000
@@ -173,6 +203,37 @@ class Engine:
                 self._index_kalshi()
             except Exception as exc:
                 print(f"universe refresh failed: {exc}")
+                errors.capture(exc, "universe.refresh")
+
+    async def _heartbeat_loop(self):
+        last_balance = 0.0
+        while True:
+            try:
+                if time.time() - last_balance > BALANCE_EVERY_S:
+                    last_balance = time.time()
+                    await self.live.refresh_balance()
+                self.live.heartbeat()
+            except Exception as exc:
+                errors.capture(exc, "engine.heartbeat")
+            await asyncio.sleep(HEARTBEAT_EVERY_S)
+
+    def _backs_up(self) -> bool:
+        """Only the real ledger is backed up (tests and benchmarks use temp ledgers)."""
+        return getattr(self.ledger, "path", None) == backup.DB_PATH and backup.DB_PATH.exists()
+
+    async def _backup_loop(self):
+        every = env_float("BACKUP_EVERY_HOURS", 6) * 3600
+        if every <= 0:
+            return
+        while True:
+            await asyncio.sleep(every)
+            try:
+                if self._backs_up():
+                    path = await asyncio.to_thread(backup.backup, self.ledger.path)
+                    if self.verbose:
+                        print(f"backup: {path}")
+            except Exception as exc:
+                errors.capture(exc, "backup.scheduled")
 
     def _index_kalshi(self):
         self.kalshi_ids = {m["id"] for m in self.universe.markets if m["venue"] == "kalshi"}
@@ -206,6 +267,7 @@ class Engine:
                 await self.handle(ev)
             except Exception as exc:
                 print(f"handle error on {ev.get('headline', '')[:60]}: {exc!r}")
+                errors.capture(exc, "engine.handle")
             finally:
                 self.queue.task_done()
 
@@ -228,6 +290,12 @@ class Engine:
             q = self.tape.quote(m["id"]) if m["venue"] == "kalshi" and self.tape_enabled else None
             if q:
                 m["yes_bid"], m["yes_ask"] = q[1], q[2]
+        capped = self.budget.block()
+        if capped:  # JEV_MAX_CALLS_PER_HOUR / JEV_MAX_USD_PER_DAY: no call, no spend
+            for t in prefetch.values():
+                t.cancel()
+            rec.update(action="PASS", reason=capped, total_ms=(time.perf_counter() - t0) * 1000)
+            return self._finish(ev, rec)
         state, questions, keyed = build_request(ev, cands)
         t1 = time.perf_counter()
         try:
@@ -235,6 +303,7 @@ class Engine:
         except (httpx.HTTPError, asyncio.TimeoutError) as exc:
             res = {"error": "network", "detail": repr(exc)}
         rec["jev_ms"] = (time.perf_counter() - t1) * 1000
+        self.budget.record((res.get("usage") or {}).get("cost") if isinstance(res, dict) else None)
 
         if "error" in res:
             for t in prefetch.values():
@@ -301,10 +370,12 @@ class Engine:
                                       synthetic=int(ev.get("synthetic", False)), shadow=0,
                                       signal_strength=d.get("strength"), signal_decisive=d.get("p_decisive"))
                     self.trades += 1
+                    rec["total_ms"] = (time.perf_counter() - t0) * 1000   # headline to paper fill, before the Kalshi round trip
+                    await self._real_order(ev, chosen, side, fill)
                 else:
                     rec["reason"] = "no_fill_within_limit"
 
-        rec["total_ms"] = (time.perf_counter() - t0) * 1000
+        rec.setdefault("total_ms", (time.perf_counter() - t0) * 1000)
         out = self._finish(ev, rec, fill)
         if chosen and book:
             self.ledger.mark(ev["id"], 0, book.best("yes"), book.bid("yes"), book.mid())
@@ -317,6 +388,7 @@ class Engine:
             handed_over = self._shadow(ev, rec, real_intent, answers, keyed, chosen, book, prefetch)
         except Exception as exc:  # a shadow bug must never look like a real-path failure
             print(f"shadow setup error (real decision already recorded) on {ev.get('headline', '')[:60]}: {exc!r}")
+            errors.capture(exc, "engine.shadow_setup")
         if not handed_over:
             for t in prefetch.values():
                 t.cancel()
@@ -355,6 +427,7 @@ class Engine:
             await self._shadow_decide(ev, rec, answers, keyed, chosen, book, prefetch)
         except Exception as exc:
             print(f"shadow error (real decision already recorded) on {ev.get('headline', '')[:60]}: {exc!r}")
+            errors.capture(exc, "engine.shadow")
         finally:
             for t in prefetch.values():
                 t.cancel()
@@ -414,6 +487,30 @@ class Engine:
                   f"fee ${fill['fee']} signal {ds['strength']:.2f} (looser rule, not a real paper trade)\n"
                   f"{'':16}   shadow market -> {s_chosen['venue']}: {s_chosen['question'][:90]}"
                   + ("" if chosen and s_id == chosen["id"] else "  (differs from the real decision's market)"))
+
+    async def _real_order(self, ev: dict, market: dict, side: str, fill: dict):
+        """The paper trade is already recorded. If the user switched to real for this session, send the same buy to
+        Kalshi at the paper fill's limit, sized by LIVE_MAX_ORDER_USD. Paper-only reasons are silent."""
+        why_not = self.live.gate(market["venue"], market["id"], bool(ev.get("synthetic")), side=side)
+        if why_not == live.NO_SIDE_REASON:
+            print(f"{'':16}-- REAL ORDER SKIPPED: {live.NO_SIDE_MESSAGE}")
+            return
+        if why_not in ("paper_mode", "paper_only_market"):
+            return
+        if why_not:
+            if self.verbose:
+                print(f"{'':16}-- REAL ORDER SKIPPED: {why_not}")
+            return
+        try:
+            row = await self.live.buy(ev["id"], market["id"], side, fill["limit"])
+        except Exception as exc:
+            errors.capture(exc, "live.buy")
+            return
+        self.live_orders += 1
+        if self.verbose:
+            print(f"{'':16}$$ REAL ORDER {side.upper()} {row.get('contracts')} @ <= {row.get('limit_price')} "
+                  f"-> {row.get('status')} filled {row.get('fill_count', 0)}" +
+                  (f" ({row['error']})" if row.get("error") else ""))
 
     def _spawn(self, coro) -> asyncio.Task:
         """Run a background coroutine, tracked so stop() can cancel it."""
@@ -491,6 +588,9 @@ class Engine:
         bs = self.feed_stats.get("bsky", {})
         b = (f"bsky {bs.get('mode')} {'up' if bs.get('connected') else 'DOWN'} {bs.get('new', 0)} posts"
              if self.bsky.enabled else "bsky off")
-        return (f"[status] polls {polls} | new items {new} | decided {self.processed} | paper trades {self.trades} | shadow {self.shadow_trades} "
-                f"| queue {self.queue.qsize()} | {tape} | {x} | {b} "
+        for name in bad:
+            errors.message(f"feed not answering: {name}", "feeds.dead")
+        mode = "REAL" if self.live.is_live() else "paper"
+        return (f"[status] mode {mode} | polls {polls} | new items {new} | decided {self.processed} | paper trades {self.trades} | shadow {self.shadow_trades} "
+                f"| real orders {self.live_orders} | queue {self.queue.qsize()} | {tape} | {x} | {b} "
                 f"| shadow mode {'on' if self.shadow_enabled else 'off'}" + (f" | dead feeds: {', '.join(bad)}" if bad else ""))

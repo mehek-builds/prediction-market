@@ -3,20 +3,48 @@
 ## 0.4.0 - 2026-10-09
 
 ### Added
+- Real trading on Kalshi, opt-in (`fastlane/live.py`). Off unless `LIVE_TRADING_ENABLED=1` and the dashboard switch is
+  flipped with the typed confirmation `TRADE REAL MONEY`; every engine start resets to paper. Immediate-or-cancel
+  buys only (Create Order V2), at the paper fill's limit, capped by `LIVE_MAX_ORDER_USD`, `LIVE_MAX_DAILY_USD`,
+  `LIVE_MAX_ORDERS_PER_HOUR` and one position per market. Trips back to paper on a restart, an auth error or three
+  failed orders. Kill switch: `python3 -m fastlane.live paper`. Ledger table `live_orders`. The dashboard masthead
+  reads `LIVE MONEY` while armed; no keyboard shortcut arms it; the switch and the shadow toggle share one write
+  guard: `X-Fastlane-Control: 1`, JSON only, Host allow-list, no CORS, 404 on the hosted copy.
 - Dashboard rebuilt as a terminal screen: TERMINAL (dark) and LEDGER (light) themes following `prefers-color-scheme`
   with a persisted toggle; command bar with keyboard shortcuts; sortable trade blotter with a card view; 24h P&L
   curve per book; latency monitor (match, Jev, book, total; p50/p90); news/decision tape; shadow-by-signal table;
   masthead cells for the tape and the feeds (X calls and spend against the daily budget, Bluesky mode, sources active
-  in the last hour); readable labels for `no_exit_liquidity`, `longshot` and `too_expensive`; 375px layout;
-  `prefers-reduced-motion` honoured. Still one static file with no external requests.
+  in the last hour); TRADING MODE panel with the real-orders table; readable labels for `no_exit_liquidity`,
+  `longshot` and `too_expensive`; 375px layout; `prefers-reduced-motion` honoured. Still one static file with no
+  external requests.
 - Shadow mode can be switched on and off at runtime from the dashboard (key `H`, masthead `SHADOW`). The setting
   lives in a new ledger `settings` table and wins over `SHADOW_ENABLED`; the engine picks it up within 2 s, no
   restart. Off stops new shadow evaluations only; existing shadow trades stay and keep being marked.
 - API: `GET /status` (ledger-derived liveness: last event, decision, trade and tick timestamps, 1h counts, per-source
-  activity, plus the `x` and `bluesky` blocks of `/health`); `GET /settings`; `POST /settings/shadow` (the only
-  non-GET route: JSON body `{"enabled": bool}`, requires `X-Fastlane-Control: 1` and `Content-Type:
-  application/json`, same Host allow-list, no CORS); `/decisions` rows gain `shortlist_ms`, `book_ms`, `n_candidates`.
-- Ledger: `settings` table (key/value, idempotent), `ticks_ts` index.
+  activity, plus the `x` and `bluesky` blocks of `/health`); `GET /settings`; `GET /control/state`;
+  `POST /settings/shadow` (JSON body `{"enabled": bool}`) and `POST /control/mode` (per-process token, rate limited),
+  the two write routes, both behind one guard (`X-Fastlane-Control: 1`, `Content-Type: application/json`, same-origin,
+  Host allow-list, no CORS, 404 on the hosted copy); `/decisions` rows gain `shortlist_ms`, `book_ms`,
+  `n_candidates`.
+- Rate limits: per-client token bucket on the API (`API_RATE_LIMIT_PER_MIN`, HTTP 429 + `Retry-After`) and a Jev
+  budget (`JEV_MAX_CALLS_PER_HOUR`, `JEV_MAX_USD_PER_DAY`; decisions logged as `PASS jev_hourly_cap` /
+  `jev_daily_spend_cap`).
+- Error reports (`fastlane/errors.py`): `fastlane/results/errors.log` on every install, plus scrubbed crash reports
+  only if you opt in (`FASTLANE_TELEMETRY=1` for the maintainer, or your own `FASTLANE_SENTRY_DSN`). New dependency
+  `sentry-sdk`.
+- Backups (`fastlane/backup.py`): scheduled (`BACKUP_EVERY_HOURS`) and on shutdown, gzipped with a row-count manifest;
+  `--verify` restore drill, `--restore`, pruning (`BACKUP_KEEP`), off-machine `BACKUP_DIR`.
+- Vercel (`fastlane/deploy.py`, `fastlane/hosted.py`): `python3 -m fastlane.deploy` puts a password-protected,
+  read-only copy of the dashboard on the user's own Vercel account; `fastlane.run --vercel` keeps it in sync.
+- `KALSHI_BASE_URL`: one host for every Kalshi call (orders, balance, market data, WebSocket). Production by default;
+  the only other accepted value is the demo host; anything else stops startup.
+- Separate data per exchange: against the demo host the ledger, backups, market cache, mode and engine files live in
+  `fastlane/results-demo/` (gitignored), never in `fastlane/results/`. The masthead reads `DEMO` when armed on demo.
+- `tools/demo_no_order_check.py` (not part of the package or the Docker image): demo-only check that the bot's NO order
+  opens a NO position. `--fill` places one marketable 1-contract NO buy, reads the signed positions endpoint and passes
+  only on +1 NO; real NO orders (`LIVE_ALLOW_NO_SIDE=1`) require a passing run.
+- `ROLLBACK.md`: the launch-day rollback plan.
+- Ledger: `settings` table (key/value, idempotent), `ticks_ts` index, `live_orders` table.
 
 ### Changed
 - `Engine.shadow_enabled` is now read from the ledger setting (falling back to `SHADOW_ENABLED`) with a 2 s cache,
@@ -28,7 +56,14 @@
   jetstream2 and jetstream1 hosts and the log line includes the close code and reason.
 - Polymarket sports markets (spreads, moneylines, totals, game lines) are excluded from the universe, including from
   an older cached `universe.json`.
-- `tests/test_no_orders.py` allows exactly one POST route in `api.py` (`/settings/shadow`).
+- API errors return `{"error": "internal"}` with no stack trace; `/docs` and `/openapi.json` are off.
+- `tests/test_no_orders.py` states one policy: order-capable code only in `fastlane/live.py` (one call site), outbound
+  POSTs only for Jev, xAI and that order call, and exactly two API write routes (`POST /settings/shadow`,
+  `POST /control/mode`) that cannot place, size or route an order; cancel, amend, batch and sell-to-close code stays
+  forbidden everywhere.
+- `Engine.handle` stamps `total_ms` (headline to paper fill) before the real order is sent, so the latency panel is
+  unaffected by the Kalshi round trip.
+- `fastlane.__version__` is `0.4.0` (it was `0.2.0`) and is pinned to the changelog head by a test.
 
 ## 0.3.0 - 2026-10-09
 

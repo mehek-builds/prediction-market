@@ -11,9 +11,8 @@ from pathlib import Path
 
 import httpx
 
-from fastlane.config import RESULTS_DIR
+from fastlane.config import RESULTS_DIR, kalshi_api_url
 
-KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 CACHE = RESULTS_DIR / "universe.json"
 CACHE_MAX_AGE_S = 30 * 60
@@ -109,7 +108,7 @@ class Universe:
                 params = {"status": "open", "with_nested_markets": "true", "limit": 200}
                 if cursor:
                     params["cursor"] = cursor
-                r = await client.get(f"{KALSHI}/events", params=params)
+                r = await client.get(f"{kalshi_api_url()}/events", params=params)
                 r.raise_for_status()
                 data = r.json()
                 for ev in data.get("events", []):

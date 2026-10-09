@@ -64,6 +64,10 @@ kbd { font: 700 10px/1.3 var(--mono); background: var(--fg); color: var(--bg); p
 #mast { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 8px 0; border-bottom: 1px solid var(--rule); }
 .wordmark { background: var(--amber); color: var(--bg); padding: 2px 8px; font-weight: 700; font-size: 13px; letter-spacing: .22em; }
 .badge.paper { border: 1px solid var(--amber); color: var(--amber); padding: 0 6px; font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+.badge.real { background: var(--down); border-color: var(--down); color: var(--bg); }
+#cmd .note.real { color: var(--down); font-weight: 700; }
+html[data-mode="live"] #cmd { border-bottom: 3px solid var(--down); }
+html[data-mode="live"] #mast { border-bottom: 2px solid var(--down); }
 .status { display: flex; flex-wrap: wrap; gap: 4px 16px; }
 .status > div { display: flex; gap: 6px; align-items: baseline; }
 dt, .lbl { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
@@ -91,6 +95,18 @@ td.empty { white-space: normal; }
 #notice .note.cool { color: var(--cool); border-color: var(--cool); }
 #notice .note.neg { border-color: var(--down); }
 code { color: var(--amber); }
+.panel.live { border-color: var(--down); }
+#control .note { padding: 6px 8px; }
+#control .arm { padding: 6px 8px; border-top: 1px solid var(--rule); }
+#control .arm ul { margin: 4px 0 8px; padding-left: 18px; }
+#control .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+#control label { display: block; margin-top: 6px; }
+#control input { font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--rule); padding: 2px 8px; max-width: 260px; }
+#control .orders { border-top: 1px solid var(--rule); overflow-x: auto; }
+.btn { border: 1px solid var(--rule); padding: 0 10px; min-height: 28px; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+.btn.danger { border-color: var(--down); color: var(--down); }
+.btn.solid { background: var(--down); border-color: var(--down); color: var(--bg); }
+.btn[aria-disabled="true"] { opacity: .6; cursor: default; }
 
 /* segmented */
 .seg { display: flex; border: 1px solid var(--rule); }
@@ -217,13 +233,13 @@ td.clip { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
   <button class="key" type="button" data-cmd="theme:toggle"><kbd>T</kbd><span>THEME</span></button>
   <button class="key" type="button" data-cmd="refresh"><kbd>R</kbd><span>REFRESH</span></button>
   <span class="spacer"></span>
-  <span class="note">PAPER</span>
+  <span class="note" id="cmd-note">PAPER</span>
   <button class="key" type="button" data-cmd="help" aria-pressed="false"><kbd>?</kbd><span>HELP</span></button>
 </header>
 <div id="app">
   <section id="mast" aria-label="System status">
     <span class="wordmark">FAST LANE</span>
-    <span class="badge paper" title="Paper only. No order is ever sent to an exchange.">PAPER</span>
+    <span class="badge paper" id="mode-badge" title="Paper only. No order is ever sent to an exchange.">PAPER</span>
     <dl class="status">
       <div><dt>RUN</dt><dd id="st-run">--</dd></div>
       <div><dt>TAPE</dt><dd id="st-tape">--</dd></div>
@@ -232,6 +248,7 @@ td.clip { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
       <div><dt>BSKY</dt><dd id="st-bsky">--</dd></div>
       <div id="st-stale-wrap" hidden><dt>HINT</dt><dd id="st-stale"></dd></div>
       <div><dt>SHADOW</dt><dd id="st-shadow">--</dd></div>
+      <div><dt>MODE</dt><dd id="st-mode">--</dd></div>
       <div><dt>DATA</dt><dd id="st-data">--</dd></div>
     </dl>
     <span class="clock"><span id="clk-et">--:--:--</span> ET <span id="clk-utc">--:--:--</span> UTC</span>
@@ -247,6 +264,10 @@ td.clip { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
       </tr></thead>
       <tbody id="book-rows"></tbody>
     </table>
+  </section>
+  <section id="control" class="panel" aria-label="Trading mode" hidden>
+    <div class="hdr"><h2>TRADING MODE</h2><span class="right" id="control-note"></span></div>
+    <div id="control-body"></div>
   </section>
   <div id="notice" aria-live="polite"></div>
   <div class="main">
@@ -304,11 +325,13 @@ const KEYS = [
   ["1 2 3 4", "Show ALL / LIVE / SHADOW / TEST trades"], ["B  C", "Blotter as table / as cards"],
   ["S", "Cycle sort: newest, best P&L, worst P&L"], ["H", "Turn shadow mode on or off (paper experiment only)"],
   ["T", "Toggle dark TERMINAL / light LEDGER theme"], ["R", "Refresh now"], ["?", "Show or hide this list"],
+  ["", "No key arms real money: TRADING MODE panel, typed confirmation, then the ARM button"],
 ];
 const state = {
   data: null, decisions: [], status: null, settings: null, error: false, toggling: false, flash: null,
   filter: "live", view: "table", sort: { key: "time", dir: "desc" }, now: Date.now() / 1000,
   seenRows: null, helpOpen: false, theme: "dark",
+  control: null, arming: false, armError: null, busy: false,
 };
 try { state.view = window.matchMedia("(max-width: 720px)").matches ? "cards" : "table"; } catch (e) {}
 
@@ -910,6 +933,185 @@ function renderCaps() {
   th.setAttribute("aria-pressed", String(state.theme === "light"));
 }
 
+// ---- trading mode (paper / real money) ----
+const BADGE_TITLE = "Paper only. No order is ever sent to an exchange.";
+let controlKey = null, armInput = null;
+const NO_TOKEN_MSG = "Arming real money only works from a browser on the machine running the API (run it outside Docker, or see LIVE_ALLOW_REMOTE_CONTROL in the README).";
+
+function renderControl() {
+  const c = state.control, panel = document.getElementById("control");
+  const badge = document.getElementById("mode-badge"), cmdNote = document.getElementById("cmd-note");
+  const cap = document.querySelector('[data-cmd="shadow:toggle"]');
+  if (!c) {   // never leave the last known state on screen after a failed fetch
+    panel.hidden = true; setCell("st-mode", "control state unavailable", "dim");
+    badge.textContent = "MODE UNKNOWN"; badge.className = "badge paper";
+    badge.title = "Control state unavailable. Check the engine and python3 -m fastlane.live paper.";
+    document.documentElement.removeAttribute("data-mode");
+    return;
+  }
+  const armed = c.mode === "live";
+  // Masthead: the one unmistakable state. Text in three places, weight and a double rule, not colour alone.
+  if (armed && c.demo) {   // armed against Kalshi's demo exchange: fake money, never shown as LIVE MONEY
+    badge.textContent = "DEMO"; badge.className = "badge paper";
+    badge.title = "Orders go to Kalshi's demo exchange (fake money). Back to paper: TRADING MODE panel or python3 -m fastlane.live paper";
+    document.documentElement.removeAttribute("data-mode");
+    document.title = "Fast lane · DEMO";
+    cmdNote.textContent = "DEMO"; cmdNote.className = "note";
+  } else if (armed) {
+    badge.textContent = "LIVE MONEY"; badge.className = "badge real";
+    badge.title = "Real Kalshi orders are being sent. Back to paper: TRADING MODE panel or python3 -m fastlane.live paper";
+    document.documentElement.setAttribute("data-mode", "live");
+    document.title = "Fast lane · LIVE MONEY";
+    cmdNote.textContent = "LIVE MONEY"; cmdNote.className = "note real";
+  } else {
+    badge.textContent = "PAPER"; badge.className = "badge paper"; badge.title = BADGE_TITLE;
+    document.documentElement.removeAttribute("data-mode");
+    document.title = "Fast lane · paper trades";
+    cmdNote.textContent = "PAPER"; cmdNote.className = "note";
+  }
+  const lim = c.limits || {};
+  if (armed && c.demo) setCell("st-mode", "DEMO · " + money(c.spent_today_usd || 0, 2) + " OF " + money(lim.max_daily_usd || 0, 2) + " TODAY", "");
+  else if (armed) setCell("st-mode", "LIVE MONEY · " + money(c.spent_today_usd || 0, 2) + " OF " + money(lim.max_daily_usd || 0, 2) + " TODAY", "neg");
+  else if (c.hosted) setCell("st-mode", "READ-ONLY COPY", "dim");
+  else if (!c.engine_running) setCell("st-mode", "PAPER · ENGINE OFF", "");
+  else if (!c.live_enabled) setCell("st-mode", "PAPER · REAL OFF", "");
+  else if (!c.kalshi_configured) setCell("st-mode", "PAPER · NO KALSHI KEY", "");
+  else setCell("st-mode", "PAPER · REAL ALLOWED", "amber");
+  if (c.hosted) {
+    cap.hidden = true;   // the shadow switch is not served on the read-only copy
+    document.getElementById("st-shadow").title = "read-only copy: the switch is on the engine machine";
+  }
+  panel.hidden = false;
+  panel.classList.toggle("live", armed);
+
+  const key = JSON.stringify([c.mode, c.hosted, c.engine_running, c.live_enabled, c.kalshi_configured, c.limits,
+    c.spent_today_usd, c.balance_usd, c.last_error, (c.orders || []).map(o => o.ts + o.market_id + o.status),
+    state.arming, state.busy, state.armError, !!c.token]);
+  if (key === controlKey) return;   // the 5 s refresh must never wipe a half-typed phrase
+  controlKey = key;
+  const hadFocus = armInput && document.activeElement === armInput;
+
+  const note = document.getElementById("control-note");
+  note.replaceChildren();
+  if (c.hosted) { note.append("SNAPSHOT ", c.snapshot_ts ? ageEl(null, c.snapshot_ts) : "--"); }
+  else if (c.balance_usd != null) note.append("KALSHI BALANCE " + money(c.balance_usd, 2));
+  const body = document.getElementById("control-body");
+  const capText = "max " + money(lim.max_order_usd || 0, 2) + " per order, " + money(lim.max_daily_usd || 0, 2) +
+    " per day, " + (lim.max_orders_per_hour || 0) + " orders an hour";
+  let msg;
+  if (c.hosted) msg = "Read-only copy on Vercel. Real trading can only be switched on from the dashboard on the machine running the engine.";
+  else if (armed) msg = "Kalshi orders are being sent with real money. Spent today " + money(c.spent_today_usd || 0, 2) +
+    " of " + money(lim.max_daily_usd || 0, 2) + ". Positions are held to settlement; close them on kalshi.com.";
+  else if (!c.engine_running) msg = "Paper trading. The engine is not running (python3 -m fastlane.run), so the real-money switch is unavailable.";
+  else if (!c.live_enabled) msg = "Paper trading. Real trading is off: set LIVE_TRADING_ENABLED=1 in .env and restart the engine to allow it.";
+  else if (!c.kalshi_configured) msg = "Paper trading. Real trading needs a Kalshi API key with trading permission in .env.";
+  else msg = "Paper trading. Real trading is allowed on this machine (" + capText + ").";
+  body.replaceChildren(el("div", "note", msg));
+  if (c.last_error) body.append(el("div", "note neg", "LAST ERROR: " + c.last_error));
+
+  const allowed = c.engine_running && c.live_enabled && c.kalshi_configured && !c.hosted && !armed;
+  const row = el("div", "row");
+  if (armed && !c.hosted) {
+    const b = el("button", "btn solid", state.busy ? "SWITCHING" : "BACK TO PAPER", { type: "button" });
+    b.addEventListener("click", () => setMode("paper"));
+    row.append(b);
+  } else if (allowed && !c.token) {   // non-loopback client (e.g. the Docker API): the API withholds the token
+    const b = el("button", "btn danger", "SWITCH TO LIVE MONEY", { type: "button" });
+    b.setAttribute("aria-disabled", "true");
+    row.append(b);
+    body.append(el("div", "note neg", NO_TOKEN_MSG));
+  } else if (allowed && !state.arming) {
+    const b = el("button", "btn danger", "SWITCH TO LIVE MONEY", { type: "button" });
+    b.addEventListener("click", () => { state.arming = true; state.armError = null; renderControl(); });
+    row.append(b);
+  }
+  if (row.childNodes.length) { const wrapRow = el("div", "note"); wrapRow.append(row); body.append(wrapRow); }
+
+  if (state.arming && !armed && !c.hosted) {
+    const arm = el("div", "arm");
+    arm.append(el("div", null, "Real money. Read this before you switch:"));
+    const ul = el("ul");
+    for (const t of [
+      "Every trade the engine takes from now on is also sent to Kalshi as a real immediate-or-cancel buy.",
+      "Hard caps: " + capText + ", one real position per market.",
+      "The bot only buys. It never sells or closes; positions are held to settlement unless you close them on kalshi.com.",
+      "Kalshi nets YES and NO in one market: a bot buy offsets a position you opened by hand in the same market.",
+      "Kalshi markets only. Polymarket, shadow and test trades stay on paper.",
+      "A restart, an auth error, or three failed orders in a row puts it back on paper.",
+      "Paper results do not predict real results. You can lose the money you trade. This is not financial advice.",
+    ]) ul.append(el("li", null, t));
+    arm.append(ul);
+    arm.append(el("label", null, "Type " + c.confirm_phrase + " to confirm", { for: "arm-phrase" }));
+    if (!armInput) armInput = el("input", null, null, { id: "arm-phrase", type: "text", autocomplete: "off", spellcheck: "false" });
+    const go = el("button", "btn solid", "ARM LIVE MONEY", { type: "button" });
+    const sync = () => go.setAttribute("aria-disabled", String(armInput.value !== c.confirm_phrase || state.busy));
+    armInput.oninput = sync; sync();
+    go.addEventListener("click", () => {
+      if (go.getAttribute("aria-disabled") === "true") return;
+      setMode("live", armInput.value);
+    });
+    const stay = el("button", "btn", "STAY ON PAPER", { type: "button" });
+    stay.addEventListener("click", () => { state.arming = false; state.armError = null; renderControl(); });
+    const arow = el("div", "row"); arow.append(armInput, go, stay);
+    arm.append(arow);
+    if (state.armError) arm.append(el("div", "note neg", state.armError));
+    body.append(arm);
+    if (hadFocus) armInput.focus();
+  } else {
+    armInput = null;
+    if (state.armError) body.append(el("div", "note neg", state.armError));
+  }
+
+  if ((c.orders || []).length) {
+    const wrap = el("div", "orders");
+    const t = el("table", "ledger"), head = el("tr");
+    for (const [h, cls] of [["TIME", ""], ["MARKET", ""], ["SIDE", ""], ["QTY", "r"], ["LIMIT", "r"], ["STATUS", ""], ["FILLED", "r"], ["COST+FEE", "r"]])
+      head.append(el("th", cls || null, h, { scope: "col" }));
+    const thead = el("thead"); thead.append(head);
+    const tb = el("tbody");
+    for (const o of c.orders) {
+      const tr = el("tr");
+      const when = td(null, "dim"); when.append(ageEl(null, o.ts));
+      tr.append(when, td(o.market_id), td(String(o.side).toUpperCase()),
+        td(String(o.contracts), "r"), td(cents(o.limit_price), "r"),
+        td(o.status + (o.error ? " (" + o.error + ")" : ""), o.status === "filled" ? "pos" : (o.status === "error" || o.status === "unknown") ? "neg" : "dim"),
+        td(o.fill_count == null ? "--" : String(o.fill_count), "r"),
+        td(o.cost == null ? "--" : money((o.cost || 0) + (o.fee || 0), 2), "r"));
+      tb.append(tr);
+    }
+    t.append(thead, tb);
+    const oh = el("div", "hdr"); oh.append(el("h2", null, "REAL ORDERS"));
+    wrap.append(oh, t);
+    body.append(wrap);
+  }
+}
+async function setMode(mode, confirm) {
+  const c = state.control;
+  if (!c || state.busy) return;
+  if (mode === "live" && !c.token) { state.armError = NO_TOKEN_MSG; renderControl(); return; }
+  state.busy = true; state.armError = null;
+  renderControl();
+  try {
+    const r = await fetch("/control/mode", { method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Fastlane-Control": "1", "X-Fastlane-Token": c.token || "" },
+      body: JSON.stringify(mode === "live" ? { mode, confirm, session: c.session } : { mode }) });
+    let j = {};
+    try { j = await r.json(); } catch (e) {}
+    if (r.ok) {
+      state.control = j; state.arming = false; state.armError = null;
+      showFlash(mode === "live" ? "neg" : "cool",
+                mode === "live" ? "LIVE MONEY ARMED · real Kalshi orders from now on" : "BACK TO PAPER", 6000);
+    } else {
+      state.armError = (j.problems || [j.error || j.detail || ("HTTP " + r.status)]).join(" · ");
+    }
+  } catch (e) {
+    state.armError = "Could not reach the API.";
+  } finally {
+    state.busy = false;
+    renderControl();
+  }
+}
+
 let noticeKey = null;
 function renderNotice() {
   const notice = document.getElementById("notice");
@@ -1073,18 +1275,21 @@ async function getJson(path) {
   return r.json();
 }
 async function load() {
-  const [tr, de, stt, set] = await Promise.all([
+  const [tr, de, stt, set, ctl] = await Promise.all([
     getJson("/trades").then(v => ({ v }), () => null),
     getJson("/decisions?limit=100").then(v => ({ v }), () => null),
     getJson("/status").then(v => ({ v }), () => null),
     getJson("/settings").then(v => ({ v }), () => null),
+    getJson("/control/state").then(v => ({ v }), () => null),
   ]);
   if (tr) { state.data = tr.v; state.error = false; } else { state.error = true; }
   if (de) state.decisions = de.v.decisions || [];
   if (stt) state.status = stt.v;
   if (set && !state.toggling) state.settings = { enabled: !!set.v.shadow_enabled, source: set.v.source };
+  state.control = ctl ? ctl.v : null;   // a failed fetch clears it: renderControl shows "unavailable"
   state.now = Date.now() / 1000;
   renderKeepFocus();
+  renderControl();
 }
 
 buildBlotterHead();

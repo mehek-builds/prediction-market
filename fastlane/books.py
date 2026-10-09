@@ -5,7 +5,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
-KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
+from fastlane.config import kalshi_api_url
+
 POLY_CLOB = "https://clob.polymarket.com"
 MAX_SLIPPAGE = 0.03     # never pay more than best ask + 3 cents
 MAX_ENTRY_PRICE = 0.95  # above this there is almost nothing left to win
@@ -42,7 +43,7 @@ class Book:
 async def fetch_book(client: httpx.AsyncClient, market: dict) -> Book:
     t0 = time.perf_counter()
     if market["venue"] == "kalshi":
-        r = await client.get(f"{KALSHI}/markets/{market['id']}/orderbook")
+        r = await client.get(f"{kalshi_api_url()}/markets/{market['id']}/orderbook")
         r.raise_for_status()
         ob = r.json().get("orderbook_fp") or {}
         yes_bids = [(float(p), float(q)) for p, q in ob.get("yes_dollars") or []]

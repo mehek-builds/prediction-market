@@ -116,3 +116,9 @@ def test_env_example_has_no_values_and_all_vars():
         assert re.search(rf"^{var}=", text, re.M), var
     for gone in ["KALSHI_ENV", "X_BEARER_TOKEN", "X_LIST_ID"]:
         assert gone not in text
+
+
+def test_version_matches_changelog_head():
+    import fastlane
+    head = re.search(r"^## (\d+\.\d+\.\d+)", (ROOT / "CHANGELOG.md").read_text(), re.M).group(1)
+    assert head == fastlane.__version__

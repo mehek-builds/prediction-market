@@ -1,3 +1,4 @@
+import json
 import time
 
 import pytest
@@ -374,7 +375,7 @@ def test_shadow_toggle_persists_and_wins_over_env(seeded, monkeypatch):
     assert r.status_code == 200                                         # charset parameter is accepted
 
 
-def test_shadow_toggle_rejects_bad_requests(seeded):
+def test_shadow_toggle_rejects_bad_requests_and_bodies(seeded):
     c, _, _ = seeded
     assert c.post("/settings/shadow", json={"enabled": True}).status_code == 403                       # no header
     assert c.post("/settings/shadow", json={"enabled": True}, headers={"X-Fastlane-Control": "yes"}).status_code == 403
@@ -471,8 +472,90 @@ def test_shadow_toggle_on_old_schema_ledger(old_ledger_path, monkeypatch, tmp_pa
 
 def test_other_routes_still_reject_post(seeded):
     c, _, _ = seeded
-    for path in ("/trades", "/decisions", "/status", "/settings", "/health"):
+    for path in ("/trades", "/decisions", "/status", "/settings", "/health", "/control/state"):
         assert c.post(path, json={}, headers=CTRL).status_code == 405, path
     for verb in ("put", "delete", "patch"):
         assert c.request(verb.upper(), "/settings/shadow", json={"enabled": True}, headers=CTRL).status_code == 405, verb
     assert c.get("/settings/shadow").status_code == 405
+
+
+# ---------- one guard for every write route ----------
+WRITES = [("/settings/shadow", {"enabled": True}), ("/control/mode", {"mode": "paper"})]
+JSON_CT = {"Content-Type": "application/json"}
+
+
+def _nothing_written(c):
+    from fastlane import live
+    assert c.get("/settings").json()["source"] == "env"
+    assert live.read_mode() == {}
+
+
+@pytest.mark.parametrize("route,body", WRITES)
+def test_write_routes_share_the_guard(seeded, route, body):
+    c, _, _ = seeded
+    assert c.post(route, json=body).status_code == 403                                           # no header
+    assert c.post(route, json=body, headers={"X-Fastlane-Control": "yes"}).status_code == 403    # wrong value
+    assert c.post(route, content=json.dumps(body), headers={**CTRL, "Content-Type": "text/plain"}).status_code == 415
+    assert c.post(route, content="a=b", headers={**CTRL, "Content-Type": "application/x-www-form-urlencoded"}
+                  ).status_code == 415
+    assert c.post(route, content="{not json", headers={**CTRL, **JSON_CT}).status_code == 400
+    api.app.middleware_stack = None        # fresh rate-limit buckets: /control/mode has a tight burst of 10
+    assert c.post(route, json={**body, "extra": 1}, headers=CTRL).status_code == 400            # unexpected key
+    assert c.post(route, json=[1], headers=CTRL).status_code == 400                              # not an object
+    assert c.post(route, json=body, headers={**CTRL, "host": "evil.example.net"}).status_code == 400   # foreign Host
+    assert c.post(route, json=body, headers={**CTRL, "Origin": "http://evil.example"}).status_code == 403
+    r = c.options(route, headers={"Origin": "http://evil.example", "Access-Control-Request-Method": "POST",
+                                  "Access-Control-Request-Headers": "x-fastlane-control,content-type"})
+    assert "access-control-allow-origin" not in r.headers and r.status_code in (400, 404, 405)
+    r = c.post(route, json=body, headers={**CTRL, "Origin": "http://evil.example"})
+    assert "access-control-allow-origin" not in r.headers
+    _nothing_written(c)
+
+
+@pytest.mark.parametrize("route,body", WRITES)
+def test_write_routes_reject_oversize_before_reading_the_body(seeded, monkeypatch, route, body):
+    from starlette.requests import Request
+    c, _, _ = seeded
+    reads = []
+
+    async def tripwire(self, *a, **k):
+        reads.append(1)
+        raise AssertionError("body read before the 413")
+
+    def tripwire_stream(self):
+        reads.append(1)
+        raise AssertionError("body read before the 413")
+    monkeypatch.setattr(Request, "body", tripwire)
+    monkeypatch.setattr(Request, "stream", tripwire_stream)
+    r = c.post(route, content=b"x" * 9999, headers={**CTRL, **JSON_CT})
+    assert r.status_code == 413 and reads == []
+    monkeypatch.undo()
+    _nothing_written(c)
+
+
+@pytest.mark.parametrize("route,body", WRITES)
+def test_write_routes_reject_oversize_bodies(seeded, route, body):
+    c, _, _ = seeded
+    big = json.dumps({**body, "pad": "x" * 2000})
+    assert c.post(route, content=big, headers={**CTRL, **JSON_CT}).status_code == 413
+    _nothing_written(c)
+
+
+@pytest.mark.parametrize("route,body", WRITES)
+def test_guard_order_header_before_content_type(seeded, route, body):
+    c, _, _ = seeded
+    assert c.post(route, content="x" * 3000, headers={"Content-Type": "text/plain"}).status_code == 403
+    assert c.post(route, content="x" * 3000, headers={**CTRL, "Content-Type": "text/plain"}).status_code == 415
+
+
+def test_hosted_has_no_writes(seeded, monkeypatch):
+    c, _, _ = seeded
+    monkeypatch.setattr(api, "HOSTED", True)
+    full = {**CTRL, **JSON_CT}
+    assert c.post("/settings/shadow", json={"enabled": False}, headers=full).status_code == 404
+    assert c.post("/control/mode", json={"mode": "paper"}, headers=full).status_code == 404
+    assert c.post("/control/mode", json={"mode": "live", "confirm": "TRADE REAL MONEY", "session": "s"},
+                  headers={**full, "X-Fastlane-Token": "x"}).status_code == 404
+    assert "token" not in c.get("/control/state").json()
+    monkeypatch.setattr(api, "HOSTED", False)
+    _nothing_written(c)

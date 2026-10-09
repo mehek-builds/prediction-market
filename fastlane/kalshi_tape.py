@@ -15,7 +15,8 @@ from collections import defaultdict, deque
 import orjson
 import websockets
 
-WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+from fastlane.config import kalshi_ws_url
+
 WS_PATH = "/trade-api/ws/v2"
 HISTORY_PER_MARKET = 300
 TRACK_SECONDS = 3600
@@ -124,7 +125,7 @@ class KalshiTape:
         while True:
             try:
                 headers = self.sign_headers("GET", WS_PATH)
-                async with websockets.connect(WS_URL, additional_headers=headers, max_size=2**22,
+                async with websockets.connect(kalshi_ws_url(), additional_headers=headers, max_size=2**22,
                                               ping_interval=20, ping_timeout=30) as ws:
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker"]}}))
                     self.connected = True

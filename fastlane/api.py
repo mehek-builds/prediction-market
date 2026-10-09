@@ -3,14 +3,21 @@
     uvicorn fastlane.api:app --port 8787
 
 GET /trades  -> every paper trade with its trigger, decision timings, live sell price, P&L and price path since entry.
-GET /decisions, /status, /settings, /health -> read-only views of the ledger.
-POST /settings/shadow -> the only write: toggles shadow mode at runtime (see README).
+GET /decisions, /status, /settings, /health, /control/state -> read-only views of the ledger and the engine state.
+POST /settings/shadow -> toggles shadow mode at runtime (see README).
+POST /control/mode -> the paper / real-money switch (localhost only, see fastlane/live.py).
+
+These two are the only writes; both go through one guard (_control_guard). Every other route is read-only.
+Errors return a plain {"error": "internal"} 500, never a stack trace.
 """
 import asyncio
+import hmac
 import json
 import os
+import secrets
 import sqlite3
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
@@ -20,19 +27,40 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from fastlane import errors, live
 from fastlane.books import fetch_book, taker_fee_per_contract
 from fastlane.decision import BUCKET_EDGES, strength_bucket
 from fastlane.ledger import DB_PATH, SCHEMA, SETTINGS_DDL, columns, mark_key, shadow_enabled_from, utc_day
+from fastlane.ratelimit import RateLimitMiddleware
 from fastlane.universe import CACHE
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+HOSTED = os.environ.get("FASTLANE_HOSTED", "").strip() == "1"  # the Vercel copy: read-only snapshot, no switch
+CONTROL_TOKEN = secrets.token_urlsafe(24)  # per process; only same-origin pages can read it (no CORS headers)
 
-app = FastAPI(title="fastlane")
+
+@asynccontextmanager
+async def lifespan(_app):
+    if not HOSTED:  # the hosted copy starts reporting in hosted.py, with the choice recorded at deploy time
+        errors.init("api")
+    yield
+    errors.flush()
+
+
+app = FastAPI(title="fastlane", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.exception_handler(Exception)
+async def internal_error(request: Request, exc: Exception):
+    errors.capture(exc, f"api {request.url.path}")
+    return JSONResponse({"error": "internal"}, status_code=500)
+
 
 # Reject unexpected Host headers (DNS rebinding). "testserver" is the Starlette test client's host.
 ALLOWED_HOSTS = ["localhost", "127.0.0.1", "testserver"] + [
     h.strip() for h in os.environ.get("FASTLANE_ALLOWED_HOSTS", "").split(",") if h.strip()]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+app.add_middleware(RateLimitMiddleware)  # added last, so it runs first: a flood is turned away before any work
 
 BOOK_TTL_S = 3.0
 _http: httpx.AsyncClient | None = None
@@ -394,31 +422,46 @@ async def settings():
 
 CONTROL_HEADER = "x-fastlane-control"   # custom header: a cross-site page cannot send it without a CORS preflight,
                                         # and there is no CORS middleware, so the preflight fails
-MAX_CONTROL_BODY = 256
 
 
-@app.post("/settings/shadow")
-async def set_shadow(request: Request):
-    """The API's only write. Toggles shadow mode at runtime (the engine re-reads within 2 s). Paper only: this
-    switches a paper-trade experiment on and off; it cannot place, size or route anything."""
+async def _control_guard(request: Request, max_body: int, allowed_keys: set):
+    """One security model for every write. Returns the parsed JSON dict, or a JSONResponse that rejects the request.
+    Order: hosted copy (404), control header (403), cross-origin (403), content type (415), size (413), JSON (400)."""
+    if HOSTED:   # read at call time; the Vercel copy has no writes at all
+        return JSONResponse({"error": "not_found"}, status_code=404)
     if request.headers.get(CONTROL_HEADER) != "1":
         return JSONResponse({"detail": "missing X-Fastlane-Control: 1"}, status_code=403)
+    origin = request.headers.get("origin")
+    if origin and origin.split("://", 1)[-1] != request.headers.get("host", ""):
+        return JSONResponse({"detail": "cross_origin"}, status_code=403)
     if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
         return JSONResponse({"detail": "Content-Type must be application/json"}, status_code=415)
     try:
         declared = int(request.headers.get("content-length") or 0)
     except ValueError:
         declared = 0
-    if declared > MAX_CONTROL_BODY:   # reject before reading the body
+    if declared > max_body:   # reject before reading the body
         return JSONResponse({"detail": "body too large"}, status_code=413)
     body = await request.body()
-    if len(body) > MAX_CONTROL_BODY:
+    if len(body) > max_body:
         return JSONResponse({"detail": "body too large"}, status_code=413)
     try:
         data = json.loads(body)
     except ValueError:
         return JSONResponse({"detail": "body is not JSON"}, status_code=400)
-    if not (isinstance(data, dict) and set(data) == {"enabled"} and isinstance(data["enabled"], bool)):
+    if not isinstance(data, dict) or set(data) - allowed_keys:
+        return JSONResponse({"detail": "unexpected keys"}, status_code=400)
+    return data
+
+
+@app.post("/settings/shadow")
+async def set_shadow(request: Request):
+    """Toggles shadow mode at runtime (the engine re-reads within 2 s). Paper only: this switches a paper-trade
+    experiment on and off; it cannot place, size or route anything."""
+    data = await _control_guard(request, 256, {"enabled"})
+    if isinstance(data, JSONResponse):
+        return data
+    if not isinstance(data.get("enabled"), bool):
         return JSONResponse({"detail": 'body must be exactly {"enabled": true|false}'}, status_code=400)
     if not DB_PATH.exists():
         return JSONResponse({"detail": "no ledger yet: start the engine once"}, status_code=503)
@@ -434,3 +477,90 @@ async def set_shadow(request: Request):
     finally:
         db.close()
     return {"shadow_enabled": data["enabled"], "source": "ledger"}
+
+
+# ---------- the paper / real-money switch ----------
+def _live_orders(db: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    if "status" not in columns(db, "live_orders"):
+        return []
+    rows = db.execute("SELECT ts, market_id, side, contracts, limit_price, status, fill_count, avg_price, cost, fee, "
+                      "error FROM live_orders ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+LOOPBACK = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+
+def _remote_control_allowed() -> bool:
+    """DANGEROUS opt-in: lets non-loopback clients read the token and arm real trading."""
+    return os.environ.get("LIVE_ALLOW_REMOTE_CONTROL", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_loopback(request: Request) -> bool:
+    return bool(request.client) and request.client.host in LOOPBACK
+
+
+def control_state(include_token: bool = False) -> dict:
+    eng, mode = live.read_engine(), live.read_mode()
+    alive = live.engine_alive(eng)
+    is_live = (not HOSTED and alive and mode.get("mode") == "live" and mode.get("session") == eng.get("session")
+               and eng.get("live_enabled") and eng.get("kalshi_configured"))
+    db = _db()
+    try:
+        orders = _live_orders(db)
+    finally:
+        db.close()
+    out = {"mode": "live" if is_live else "paper", "hosted": HOSTED, "engine_running": alive,
+           "session": eng.get("session") if alive and not HOSTED else None,
+           "live_enabled": bool(eng.get("live_enabled")), "kalshi_configured": bool(eng.get("kalshi_configured")),
+           "demo": bool(eng.get("demo")),
+           "limits": eng.get("limits") or live.limits(), "balance_usd": eng.get("balance_usd"),
+           "spent_today_usd": eng.get("spent_today_usd"), "last_error": eng.get("last_error"),
+           "last_switch": {k: mode.get(k) for k in ("mode", "ts", "reason")} if mode else None,
+           "confirm_phrase": live.CONFIRM_PHRASE, "orders": orders}
+    if HOSTED:
+        try:
+            out["snapshot_ts"] = json.loads((Path(__file__).resolve().parent / "hosted_meta.json").read_text())["snapshot_ts"]
+        except (OSError, ValueError, KeyError):
+            out["snapshot_ts"] = None
+    elif include_token:
+        out["token"] = CONTROL_TOKEN
+    return out
+
+
+@app.get("/control/state")
+async def control_get(request: Request):
+    return control_state(include_token=_is_loopback(request) or _remote_control_allowed())
+
+
+@app.post("/control/mode")
+async def control_mode(request: Request):
+    """Flip between paper and real. Paper always works. Real needs the engine running with LIVE_TRADING_ENABLED=1
+    and a Kalshi key, this process's token (so another website cannot do it), and the exact confirmation phrase."""
+    body = await _control_guard(request, 512, {"mode", "confirm", "session"})
+    if isinstance(body, JSONResponse):
+        return body
+    want = body.get("mode")
+    eng = live.read_engine()
+    if want == "paper":  # always allowed, no token: forcing paper is harmless, and it must work even with a stale page
+        live.set_paper("dashboard", session=eng.get("session"))
+        return control_state(include_token=_is_loopback(request) or _remote_control_allowed())
+    if want != "live":
+        return JSONResponse({"error": "mode must be paper or live"}, status_code=400)
+    if not (_is_loopback(request) or _remote_control_allowed()):
+        return JSONResponse({"error": "loopback_only",
+                             "detail": "real trading can only be armed from this machine"}, status_code=403)
+    if not hmac.compare_digest(request.headers.get("x-fastlane-token", "").encode("utf-8", "replace"),
+                               CONTROL_TOKEN.encode()):
+        return JSONResponse({"error": "bad_token"}, status_code=403)
+    problems = [p for ok, p in [
+        (live.engine_alive(eng), "the engine is not running (python3 -m fastlane.run)"),
+        (body.get("session") == eng.get("session"), "the engine restarted since this page loaded; reload and confirm again"),
+        (eng.get("live_enabled"), "LIVE_TRADING_ENABLED=1 is not set in .env (restart the engine after setting it)"),
+        (eng.get("kalshi_configured"), "no Kalshi API key (KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH)"),
+        (body.get("confirm") == live.CONFIRM_PHRASE, f'type "{live.CONFIRM_PHRASE}" exactly to confirm'),
+    ] if not ok]
+    if problems:
+        return JSONResponse({"error": "not_armed", "problems": problems}, status_code=409)
+    live.arm(eng["session"])
+    return control_state(include_token=_is_loopback(request) or _remote_control_allowed())

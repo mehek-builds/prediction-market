@@ -679,6 +679,8 @@ def test_start_writes_x_disabled_status_when_x_is_off(eng, monkeypatch):
     monkeypatch.setattr(eng, "_worker", noop)
     monkeypatch.setattr(eng, "_keepwarm_loop", noop)
     monkeypatch.setattr(eng, "_refresh_universe_loop", noop)
+    monkeypatch.setattr(eng, "_heartbeat_loop", noop)    # added by the real-trading merge: both loops run forever
+    monkeypatch.setattr(eng, "_backup_loop", noop)
 
     async def go():
         await eng.start(feeds=True)

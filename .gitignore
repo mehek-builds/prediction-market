@@ -7,6 +7,7 @@
 *.db-wal
 *.db-shm
 fastlane/results/
+fastlane/results-demo/
 __pycache__/
 *.pyc
 .pytest_cache/

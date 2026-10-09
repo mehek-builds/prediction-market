@@ -97,3 +97,27 @@ def test_run_exits_on_invalid_xai_settings():
 def test_run_exits_on_invalid_bsky_handles():
     r = _run_cli({"BSKY_HANDLES": "not a handle"})
     assert r.returncode != 0 and "BSKY" in (r.stderr + r.stdout) and "Traceback" not in (r.stderr + r.stdout)
+
+
+def test_stop_survives_a_failing_close_and_still_backs_up(monkeypatch, tmp_path):
+    """One feed failing to close must not skip the other closes or the shutdown backup."""
+    import asyncio
+    from fastlane import backup
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    db = tmp_path / "ledger.db"
+    monkeypatch.setattr(engine, "Ledger", lambda: Ledger(db))
+    monkeypatch.setattr(backup, "DB_PATH", db)
+    monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "b"))
+    e = engine.Engine(workers=1, verbose=False)
+    closed = []
+
+    async def boom():
+        raise RuntimeError("feed close failed")
+
+    async def ok():
+        closed.append("jev")
+    monkeypatch.setattr(e.xfeed, "aclose", boom)
+    monkeypatch.setattr(e.jev, "aclose", ok)
+    asyncio.run(e.stop())
+    assert closed == ["jev"] and e.http.is_closed
+    assert backup.list_backups(tmp_path / "b")
