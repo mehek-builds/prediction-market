@@ -1,0 +1,144 @@
+# prediction-market
+
+A paper-only, news-driven trading research bot for Kalshi and Polymarket. It reads headlines, matches them to open
+markets, asks a decision model one typed question per candidate market, applies a fixed trade rule, and simulates a
+fill against the live order book. Nothing is ever sent to an exchange: there is no order-placing code anywhere in
+this repository, and a test enforces that.
+
+> **Disclaimer.** This is educational and research software. It trades on paper only, forever. It is not financial
+> advice. It comes with no warranty (see AGPL-3.0 sections 15 and 16). You are responsible for checking the Kalshi
+> and Polymarket terms of service and your own eligibility in your jurisdiction. Do not use VPNs or any other means
+> to evade geo-restrictions. Prediction markets may be restricted or illegal where you live.
+
+Requires Python >= 3.11.
+
+## Architecture
+
+```
+news pollers (17 RSS feeds + SEC 8-K)   +   Kalshi live tape (WebSocket, optional) -> move detector
+  -> market match (IDF index over ~31k open markets, <1 ms)
+  -> Jev decision (one call, one question per candidate market) + order books prefetched in parallel
+  -> fixed trade rule (decision.py) + freshness guards (stale news, already priced in)
+  -> paper fill walking the live order book, with Kalshi taker fees
+  -> price marks at +5s, 30s, 60s, 5m, 15m, 1h
+```
+
+| File | Role |
+|---|---|
+| `fastlane/config.py` | Repo root, results directory, `.env` loading. |
+| `fastlane/feeds.py` | Async pollers with conditional GETs. First poll of each feed is backlog and never traded. |
+| `fastlane/universe.py` | Loads open Kalshi (non-sports) and top Polymarket markets, builds the match index. |
+| `fastlane/jev_client.py` | Pooled HTTP/2 client for the OpenRouter Decisions API, pinned to `typesafe/jev-1.13`. |
+| `fastlane/decision.py` | The per-market Jev questions and the fixed trade thresholds. |
+| `fastlane/books.py` | Order books normalised to ask ladders, book-walking fill, Kalshi fee formula. |
+| `fastlane/engine.py` | Hot path, risk checks, keep-warm pings, price marks. |
+| `fastlane/ledger.py` | SQLite tables: events, decisions (per-stage timings), trades, marks. |
+| `fastlane/kalshi.py` | Signs the Kalshi WebSocket handshake (RSA-PSS or Ed25519); read-only. |
+| `fastlane/kalshi_tape.py` | Live Kalshi quotes: price-at-publish-time, first reaction time, and the move detector. |
+| `fastlane/report.py` | Stage latencies, source lag, decisions, market moves after news, mark-to-bid P&L. |
+| `fastlane/bench_jev.py` | Standalone Jev benchmark. |
+| `fastlane/api.py` | Read-only FastAPI over the ledger (`GET` routes only). |
+| `fastlane/static/index.html` | Single-file dashboard served at `/`, no external requests. |
+
+## Quick start
+
+```bash
+git clone https://github.com/mehek-builds/prediction-market && cd prediction-market
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env            # fill in OPENROUTER_API_KEY at minimum
+python3 -m fastlane.run --inject "Fed cuts rates by 50 bps" --minutes 1   # synthetic end-to-end test
+python3 -m fastlane.run                                                   # live, Ctrl-C to stop
+python3 -m uvicorn fastlane.api:app --port 8787                           # in a second terminal
+open http://localhost:8787
+```
+
+Environment variables (see `.env.example`):
+
+| Variable | Needed | What it does |
+|---|---|---|
+| `OPENROUTER_API_KEY` | required | OpenRouter key used for the Jev decision model (Decisions API). |
+| `JEV_MODEL` | optional | Model id sent to OpenRouter. Default pins the version the trade rule was tuned on. |
+| `KALSHI_API_KEY_ID` | optional | Kalshi API key id for the live WebSocket tape. |
+| `KALSHI_PRIVATE_KEY_PATH` | optional | Path to the PEM file, OR the full PEM text, OR the bare base64 body of a PKCS#8 key (RSA or Ed25519). |
+| `SEC_USER_AGENT` | optional | Contact string for the SEC EDGAR poller, format `Name email@example.com` (SEC fair-access policy). |
+| `PAPER_BANKROLL_USD` | optional | Paper bankroll, default 10000. |
+| `PAPER_MAX_TRADE_PCT` | optional | Fraction of bankroll per trade, default 0.02. |
+| `PAPER_DAILY_LOSS_HALT_PCT` | optional | Daily loss halt as a fraction of bankroll, default 0.05. |
+| `FASTLANE_ALLOWED_HOSTS` | optional | Extra Host header values the dashboard API accepts (comma separated). `localhost` and `127.0.0.1` are always allowed; other Hosts get HTTP 400 (DNS rebinding guard). |
+
+What is disabled when the optional ones are empty:
+
+- No Kalshi key (or only one of the two Kalshi variables): the live tape is off. That removes the move detector,
+  the price-at-publish lookup and the priced-in guard. Public Kalshi market data and order books still work.
+- No `SEC_USER_AGENT`: the EDGAR 8-K poller is off. The RSS feeds still run.
+
+## Commands
+
+```bash
+python3 -m fastlane.run                          # live until Ctrl-C
+python3 -m fastlane.run --minutes 30 --workers 8 # live for 30 minutes, 8 decision workers
+python3 -m fastlane.run --inject "headline"      # synthetic headline (repeatable), live feeds off
+python3 -m fastlane.report                       # timeline + P&L from the ledger
+python3 -m fastlane.report --since-minutes 60
+python3 -m fastlane.bench_jev --n 200 --repeats 3 --concurrency 4   # Jev latency/stability benchmark
+python3 -m fastlane.bench_jev --dry-run          # sources only, no Jev calls, no key needed
+python3 -m uvicorn fastlane.api:app --port 8787  # dashboard and JSON API
+python3 -m pytest -q                             # tests (offline, no keys)
+```
+
+Docker (the Dockerfile header has the same commands):
+
+```bash
+docker build -t fastlane .
+docker run -d --restart unless-stopped --env-file .env -v fastlane-results:/app/fastlane/results fastlane
+docker run -p 127.0.0.1:8787:8787 --env-file .env -v fastlane-results:/app/fastlane/results fastlane \
+  python3 -m uvicorn fastlane.api:app --host 0.0.0.0 --port 8787
+```
+
+`--env-file` cannot hold multi-line values, so put the Kalshi key body on one line or mount a key file.
+
+## Trade rule and guards
+
+One Jev question per candidate market (up to 8, one call). Trade only if one candidate gets >= 0.85 probability on
+(decisive + toward) in one direction AND >= 0.30 on decisive. Among qualifiers, pick the most room to profit.
+Then the freshness guards: no trade if the news was published > 10 min before we saw it, or if the Kalshi price
+already moved >= 3c our way since publication. Size = `PAPER_MAX_TRADE_PCT` of bankroll, never paying more than
+best ask + 3 cents or above 95 cents. One position per market, daily loss halt at `PAPER_DAILY_LOSS_HALT_PCT`.
+
+Also: the first poll of every feed is backlog and is never traded. The Kalshi taker fee is
+`0.07 * n * p * (1-p)`, rounded up to the next cent. Price marks are recorded at +5s, 30s, 60s, 5m, 15m and 1h.
+
+## Measured performance (measured on one setup, yours will differ)
+
+- Jev decision p50: ~375 ms.
+- End to end, headline to paper fill: 340-440 ms.
+- Market matcher: < 1 ms over ~31k markets.
+
+Running in a US-East region cuts round trips to the US-hosted APIs (OpenRouter, Kalshi, Polymarket, SEC, the news
+CDNs). Numbers above come from one setup.
+
+Speed notes:
+
+- Connections are kept warm every 3 s (upstreams drop idle connections after ~5 s; a cold call costs ~400 ms more).
+- Every candidate's order book is fetched while Jev is deciding, so the fill never waits.
+- Feeds are polled at their CDN refresh rate (Cache-Control max-age); faster returns identical bytes.
+- Feed parsing runs off the event loop; failing feeds back off exponentially.
+
+## Limitations
+
+- Free RSS lags publication by 30 s to minutes, so most tradable news is already priced in.
+- Jev (TypeSafe, via the OpenRouter Decisions API, early access) may change or disappear, and vendor latency claims
+  are unverified.
+- The Kalshi tape needs an API key. Polymarket has no live tape here.
+- Paper fills assume the book you fetched is the book you would have hit.
+- There is no resolution tracking: P&L is mark-to-bid.
+
+## Outputs
+
+`fastlane/results/` (gitignored): `ledger.db` (SQLite), `universe.json` (market cache, refreshed every 15 min), and
+benchmark files.
+
+## Contributing and license
+
+Run `python3 -m pytest -q` before sending changes. Licensed under AGPL-3.0, see `LICENSE`.

@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.db
+*.db-wal
+*.db-shm
+fastlane/results/
+__pycache__/
+*.pyc
+.pytest_cache/
+.pipeline/
+.venv/
+.DS_Store

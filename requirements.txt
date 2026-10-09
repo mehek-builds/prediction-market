@@ -1,0 +1,9 @@
+httpx[http2]==0.28.1
+feedparser==6.0.12
+python-dotenv==1.2.2
+cryptography==46.0.5
+websockets==16.0
+orjson==3.11.8
+fastapi==0.136.1
+uvicorn==0.46.0
+pytest==9.0.3
