@@ -131,3 +131,16 @@ def test_stale_news_is_blocked_without_trade(eng):
     assert rec["reason"] not in ("signal_yes", "signal_no")  # dashboard "traded" highlight keys off these
     assert eng.trades == 0
     assert _trades(eng) == []
+
+
+def test_no_room_signal_is_pass_priced_in_without_trade(eng):
+    for m in eng.universe.markets:
+        if m["id"] == "AVNT-1":
+            m["yes_ask"], m["yes_bid"] = .97, .96   # YES already near certainty; fake book (.55) would otherwise fill
+    rec = _run(eng, _event())
+    assert (rec["action"], rec["reason"]) == ("PASS", "priced_in")
+    assert rec["market_id"] == "AVNT-1"           # the market is still chosen and tracked
+    assert rec.get("mid_at_decision") is not None # book was fetched for marks
+    assert eng.trades == 0 and _trades(eng) == []
+    row = eng.ledger.db.execute("SELECT action, reason FROM decisions WHERE event_id='ev1'").fetchone()
+    assert row == ("PASS", "priced_in")

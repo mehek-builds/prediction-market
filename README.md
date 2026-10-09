@@ -101,7 +101,12 @@ docker run -p 127.0.0.1:8787:8787 --env-file .env -v fastlane-results:/app/fastl
 ## Trade rule and guards
 
 One Jev question per candidate market (up to 8, one call). Trade only if one candidate gets >= 0.85 probability on
-(decisive + toward) in one direction AND >= 0.30 on decisive. Among qualifiers, pick the most room to profit.
+(decisive + toward) in one direction AND >= 0.30 on decisive. Among qualifiers, pick the most room to profit, where
+room is 1 minus the entry price on the signalled side. A qualifier whose signalled side already trades at or above 95
+cents (5 cents of room or less) is dropped before ranking; if
+every qualifier is priced like that the decision is logged as `PASS priced_in` (no trade, market still tracked for
+calibration). The same `priced_in` reason also comes from the freshness guard below, with a `BUY_*` action instead of
+`PASS`.
 Then the freshness guards: no trade if the news was published > 10 min before we saw it, or if the Kalshi price
 already moved >= 3c our way since publication. Size = `PAPER_MAX_TRADE_PCT` of bankroll, never paying more than
 best ask + 3 cents or above 95 cents. One position per market, daily loss halt at `PAPER_DAILY_LOSS_HALT_PCT`.

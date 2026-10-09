@@ -6,6 +6,8 @@ picked. Naming the market inside each question removes that ambiguity (e.g. "Fed
 "no change" market and NO for the "cut 25 bps" market).
 """
 
+from fastlane.books import MAX_ENTRY_PRICE  # 0.95: the fill guard's cap, reused so "no room" means "would not fill"
+
 # Fixed decision threshold: the trade rule lives here, not in the model.
 SIGNAL_THRESHOLD = 0.85   # probability mass on (decisive + toward) in one direction
 DECISIVE_MIN = 0.30       # ...and at least this much on "decisive". Lean-only news is tracked (marks), not traded,
@@ -44,6 +46,8 @@ def decide(answers: dict, keyed: dict | None = None) -> dict:
     """Score every candidate, then pick the qualifying one with the most room to profit.
 
     Room = 1 - entry price on the signalled side, from the cached quote (the live book is used for the fill).
+    Qualifiers with no room (entry at or above MAX_ENTRY_PRICE, so the fill guard would refuse them anyway) are dropped; if
+    only such qualifiers exist the answer is PASS / priced_in and the market is still tracked.
     Without qualifiers, report the strongest candidate so it can still be tracked for calibration.
     """
     keyed = keyed or {}
@@ -60,10 +64,14 @@ def decide(answers: dict, keyed: dict | None = None) -> dict:
                       "room": (1 - entry) if entry else 0.5})
     if not cands:
         return {"action": "PASS", "reason": "no_answers", "key": None}
-    qualified = [c for c in cands if _qualifies(c)]
+    signalled = [c for c in cands if _qualifies(c)]
+    qualified = [c for c in signalled if c["room"] > 1 - MAX_ENTRY_PRICE]
     if qualified:
         best = max(qualified, key=lambda c: (c["room"], c["strength"]))
         return {**best, "action": "BUY_YES" if best["side"] == "yes" else "BUY_NO", "reason": f"signal_{best['side']}"}
+    if signalled:  # a correct call on a market already priced near certainty: nothing left to win, track it only
+        best = max(signalled, key=lambda c: c["strength"])
+        return {**best, "action": "PASS", "reason": "priced_in"}
     best = max(cands, key=lambda c: c["strength"])
     if best["strength"] < MARK_THRESHOLD:
         return {**best, "action": "PASS", "reason": "irrelevant", "key": None}
