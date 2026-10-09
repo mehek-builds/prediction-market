@@ -73,7 +73,7 @@ class RateLimitMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        tight = scope.get("method") == "POST" and scope.get("path", "") == "/control/mode"
+        tight = scope.get("path", "") == "/control/mode" and scope.get("method") != "GET"  # any write to the switch
         bucket = self.control if tight else self.general
         wait = bucket.take(client_key(scope))
         if wait:

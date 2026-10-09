@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+import pytest
+
 from fastlane import kalshi_tape
 from fastlane.kalshi_tape import MOVE_COOLDOWN_S, KalshiTape
 
@@ -18,7 +20,8 @@ INFO = {"category": "Politics", "volume_24h": 1000, "question": "Q"}
 
 def make(info=INFO):
     calls = []
-    tape = KalshiTape(StubLedger(), market_info=lambda t: info, on_move=lambda *a: calls.append(a))
+    tape = KalshiTape(StubLedger(), market_info=lambda t: info, on_move=lambda *a: calls.append(a),
+                      deny_re=kalshi_tape.move_deny_re())
     return tape, calls
 
 
@@ -94,3 +97,44 @@ def test_run_without_sign_headers_returns(monkeypatch):
     monkeypatch.setattr(kalshi_tape.websockets, "connect", boom)
     tape = KalshiTape(StubLedger(), sign_headers=None)
     assert asyncio.run(asyncio.wait_for(tape.run(), 2)) is None
+
+
+GAS = {"category": "Economics", "volume_24h": 1000, "question": "US gas prices tomorrow: Above 4.36"}
+
+
+def test_deny_gas_ladders_by_title_and_ticker():
+    for info, ticker in ((GAS, "KXAAAGAS-25OCT10-T4.36"),
+                         ({**GAS, "question": "Minnesota gas prices tomorrow: Above 3.10"}, "KXMNGAS-25OCT10-T3.10"),
+                         ({**GAS, "question": "Average AAA: Above 4.36"}, "KXAAAGAS-25OCT10-T4.36"),
+                         ({**GAS, "question": "Bitcoin price on Oct 15 at 5pm EDT: Above 120,000"}, "KXBTC-25OCT15-T120000"),
+                         ({**GAS, "question": "Gold price this week: Above 4,000"}, "KXGOLDW-25OCT17-T4000")):
+        tape, calls = make(info)
+        tape.hist[ticker].append((970, .40, .42)); tape._check_move(ticker, 1000, .50, .52)
+        assert calls == [] and tape.moves_denied == 1, info["question"]
+
+
+def test_denied_move_does_not_set_cooldown():
+    tape, calls = make(GAS)
+    tape.hist["KXAAAGAS-25OCT10-T4.36"].append((970, .40, .42))
+    tape._check_move("KXAAAGAS-25OCT10-T4.36", 1000, .50, .52)
+    assert calls == [] and tape.moves == 0 and tape._cooldown == {}
+
+
+def test_deny_pattern_lets_news_markets_through():
+    for q in ("Fed decision in October: Cut 25 bps", "Will the price of eggs be discussed at the debate?",
+              "Government shutdown ends by Oct 20?"):
+        tape, calls = make({"category": "Economics", "volume_24h": 1000, "question": q})
+        tape.hist["KXSHUT-25OCT20"].append((970, .40, .42)); tape._check_move("KXSHUT-25OCT20", 1000, .50, .52)
+        assert len(calls) == 1, q
+
+
+def test_deny_env_override_and_validation(monkeypatch):
+    monkeypatch.setenv("MOVE_DENY_RE", "^NEVER$")
+    tape, calls = make(GAS); tape.deny_re = kalshi_tape.move_deny_re()
+    tape.hist["KXAAAGAS-25OCT10-T4.36"].append((970, .40, .42)); tape._check_move("KXAAAGAS-25OCT10-T4.36", 1000, .50, .52)
+    assert len(calls) == 1                                      # env pattern replaces the default
+    monkeypatch.setenv("MOVE_DENY_RE", "(unclosed")
+    with pytest.raises(ValueError):
+        kalshi_tape.move_deny_re()
+    monkeypatch.setenv("MOVE_DENY_RE", "")
+    assert kalshi_tape.move_deny_re().pattern == kalshi_tape.MOVE_DENY_DEFAULT

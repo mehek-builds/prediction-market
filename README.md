@@ -17,7 +17,7 @@ Requires Python >= 3.11.
 ## Architecture
 
 ```
-news pollers (17 RSS feeds + SEC 8-K)   +   Kalshi live tape (WebSocket, optional) -> move detector
+news: 18 RSS feeds + SEC 8-K  |  X (10 handles via xAI x_search, 60 s)  |  Bluesky newsrooms (Jetstream)  |  Kalshi live tape -> move detector
   -> market match (IDF index over ~31k open markets, <1 ms)
   -> Jev decision (one call, one question per candidate market) + order books prefetched in parallel
   -> fixed trade rule (decision.py) + freshness guards (stale news, already priced in)
@@ -28,7 +28,9 @@ news pollers (17 RSS feeds + SEC 8-K)   +   Kalshi live tape (WebSocket, optiona
 | File | Role |
 |---|---|
 | `fastlane/config.py` | Repo root, results directory, `.env` loading. |
-| `fastlane/feeds.py` | Async pollers with conditional GETs. First poll of each feed is backlog and never traded. |
+| `fastlane/feeds.py` | Async pollers with conditional GETs. First poll of each feed is backlog and never traded. Includes the unofficial Trump archive feed. |
+| `fastlane/x_feed.py` | X posts from a fixed handle group through xAI's x_search; one Grok call per poll, windowed and budget-capped. |
+| `fastlane/bluesky.py` | Bluesky newsroom accounts over Jetstream, with a getAuthorFeed polling fallback. |
 | `fastlane/universe.py` | Loads open Kalshi (non-sports) and top Polymarket markets, builds the match index. |
 | `fastlane/jev_client.py` | Pooled HTTP/2 client for the OpenRouter Decisions API, pinned to `typesafe/jev-1.13`. |
 | `fastlane/decision.py` | The per-market Jev questions, the fixed trade thresholds, the shadow rule and cost filter settings. |
@@ -77,6 +79,15 @@ Environment variables (see `.env.example`):
 | `SHADOW_ENABLED` | optional | Record a shadow book of what a looser rule would have traded, default true. |
 | `SHADOW_SIGNAL_THRESHOLD` | optional | Shadow rule signal threshold, default 0.60 (real rule: 0.85, unchanged). |
 | `SHADOW_DECISIVE_MIN` | optional | Shadow rule decisive minimum, default 0.0 (real rule: 0.30, unchanged). |
+| `XAI_API_KEY` | optional | xAI key. Enables the X poller; about $0.018 to $0.055 per call (measured). Off when empty. |
+| `XAI_X_HANDLES` | optional | Up to 10 X handles, comma separated, without @. Default: DeItaone, FirstSquawk, LiveSquawk, zerohedge, unusual_whales, Polymarket, Breaking911, KobeissiLetter, WhiteHouse, truthsocial. |
+| `XAI_POLL_SECONDS` | optional | Seconds between calls inside the window, min 15, default 60. |
+| `XAI_DAILY_BUDGET_USD` | optional | Hard cap per UTC day from the API's own cost field, persisted in the ledger; polling stops for the day when reached. Default 25. |
+| `XAI_WINDOW_DAYS` / `XAI_WINDOW_HOURS` / `XAI_WINDOW_TZ` | optional | Active window, default Mon-Fri 09:00-16:30 America/New_York. |
+| `BSKY_ENABLED` | optional | Bluesky Jetstream consumer, keyless, default true. |
+| `BSKY_HANDLES` | optional | Comma separated Bluesky handles, default the ten newsroom accounts in `.env.example`. |
+| `MIN_ENTRY_PRICE` | optional | Cost filter: skip entries below this price (long shots), default 0.03. |
+| `MOVE_DENY_RE` | optional | Regex (case-insensitive) matched against a Kalshi market's title and ticker; matching markets never fire the move detector. Default excludes gas price and other price-on-a-date ladders. |
 | `FASTLANE_ALLOWED_HOSTS` | optional | Extra Host header values the dashboard API accepts (comma separated). `localhost` and `127.0.0.1` are always allowed; other Hosts get HTTP 400 (DNS rebinding guard). |
 | `LIVE_TRADING_ENABLED` | optional | `1` allows the dashboard's real-money switch. Off by default. See [Real trading](#real-trading-opt-in). |
 | `LIVE_MAX_ORDER_USD` | optional | Real trading: most one order may cost, fees included. Default 5. |
@@ -96,6 +107,8 @@ What is disabled when the optional ones are empty:
 - No Kalshi key (or only one of the two Kalshi variables): the live tape is off. That removes the move detector,
   the price-at-publish lookup and the priced-in guard. Public Kalshi market data and order books still work.
 - No `SEC_USER_AGENT`: the EDGAR 8-K poller is off. The RSS feeds still run.
+- No `XAI_API_KEY`: the X poller is off; nothing is billed.
+- `BSKY_ENABLED=false`: no Bluesky.
 
 ## Commands
 
@@ -126,6 +139,37 @@ docker run -p 127.0.0.1:8787:8787 --env-file .env -v fastlane-results:/app/fastl
 
 `--env-file` cannot hold multi-line values, so put the Kalshi key body on one line or mount a key file.
 
+## Fast sources
+
+Why: on 5 stories covered by both, our RSS feeds saw the story a median of about 32 minutes after the first X post
+(range -5 to +109 minutes). The first reporters were wire and squawk accounts on X. The engine decides in about 400 ms;
+the feeds are the bottleneck. Three faster sources feed the same event queue. They only produce headlines (no source
+places orders), and post text is treated as untrusted data (it is stored and shown as a headline, never used as an instruction or a
+query).
+
+**X via xAI.** Each poll is one Grok call with the `x_search` tool over the handle group: one `x_keyword_search`, at
+most about 10 posts, a few to 15 seconds (4 to 15 measured), about $0.018 to $0.055. `max_tool_calls: 1` stops Grok from opening threads at triple the
+cost. A returned post is accepted only if its URL handle is in the allowed list, its snowflake id decodes to a time
+inside the poll window (Grok can answer from memory when the search is empty), and the id is new; rejections are
+counted. Calls happen only inside the active window (default Mon-Fri 09:00-16:30 New York) and under the daily
+budget, which is read from the ledger so a restart does not reset it. A full default window is 7.5 hours at 60 calls
+an hour, so a full default window is 450 calls: about $8 to $25 at the measured cost, so the $25 cap only binds at
+the high end; the window is the usual limit. The first poll of each window (and the first after a
+budget stop or a long backoff) is backlog: seen, never traded.
+
+**Bluesky.** Newsroom accounts over the keyless Jetstream firehose, own top-level posts only (replies and reposts are
+skipped). If the socket fails, `getAuthorFeed` is polled every 15 s for 5 minutes, then the socket is retried. Posts
+missed during a reconnect gap are lost on purpose (replaying would be backlog). `createdAt` is clamped to the receipt
+time.
+
+**Trump.** His X account is near-dormant. Truth Social blocks automated access and is never fetched.
+`trumpstruth.org` is an UNOFFICIAL third-party archive, polled every 10 s as an ordinary RSS feed, and `@truthsocial`
+is in the default X group.
+
+Expected lag per source (the source-lag section of `python3 -m fastlane.report` shows yours): Bluesky seconds, X about
+half a poll interval plus the call, RSS minutes. `GET /health` reports X calls and spend today, the budget and window
+flags, and the Bluesky connection state.
+
 ## Trade rule and guards
 
 One Jev question per candidate market (up to 8, one call). Trade only if one candidate gets >= 0.85 probability on
@@ -142,6 +186,10 @@ Then the cost filter: no trade if the live book's spread on the held side is ove
 round-trip cost (that spread plus the entry and exit Kalshi taker fees per contract, 0 on Polymarket) is more than
 `COST_TO_ROOM_MAX` (25%) of the room to profit, logged as `PASS too_expensive`. The 0.85 / 0.30 thresholds are
 unchanged. Room in the cost filter comes from the live book (1 minus best ask), not the cached quote used for ranking.
+The same filter blocks `no_exit_liquidity` (the held side has no bid, so the position could never be sold) and
+`longshot` (entry below `MIN_ENTRY_PRICE`, 3c). All three are recorded as `PASS`. Markets whose title or ticker match
+`MOVE_DENY_RE` (gas price and other price-on-a-date ladders) never fire the move detector, and a move event never
+matches markets of its own series family.
 The filter runs after selection, so when the chosen market is too expensive a cheaper second qualifier is not picked
 (the market is still tracked).
 
@@ -243,6 +291,8 @@ Storage: `trades.shadow = 1` with `signal_strength` and `signal_decisive`; marks
 the real `PASS` decision also tracks its own market under the plain event id, and the shadow rule may pick a different
 market on the same event.
 
+The console line for a shadow fill names the shadow market, which can differ from the market the real decision considered.
+
 Where to see it: the dashboard Shadow tab (with the bucket strip), `/trades?book=shadow`, and the "Shadow vs real"
 section of `python3 -m fastlane.report`.
 
@@ -269,7 +319,7 @@ Speed notes:
 
 ## Limitations
 
-- Free RSS lags publication by 30 s to minutes, so most tradable news is already priced in.
+- RSS lags the first X post by a median of about half an hour on the stories we measured; X via xAI costs money and returns at most about 10 posts per call, so a very busy minute can be truncated; Bluesky newsrooms post a subset of their wire output.
 - Jev (TypeSafe, via the OpenRouter Decisions API, early access) may change or disappear, and vendor latency claims
   are unverified.
 - The Kalshi tape needs an API key. Polymarket has no live tape here.

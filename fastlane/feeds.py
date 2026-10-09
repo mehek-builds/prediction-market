@@ -37,6 +37,9 @@ FEEDS = {
     "nyt_business": ("https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", 10),
     "nyt_politics": ("https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", 10),
     "coindesk": ("https://www.coindesk.com/arc/outboundfeeds/rss/", 10),
+    # Unofficial third-party archive of Trump's Truth Social posts (Truth Social itself blocks automated access and is
+    # never fetched). Polled at 10 s; the poller's Cache-Control and failure backoff apply as for every feed.
+    "trumpstruth": ("https://www.trumpstruth.org/feed", 10),
 }
 
 EDGAR_URL = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb="

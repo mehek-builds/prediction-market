@@ -1,5 +1,7 @@
 import pytest
 
+from fastlane import books
+
 from fastlane.books import kalshi_taker_fee, simulate_fill
 
 
@@ -97,7 +99,7 @@ def test_cost_block_no_side(book_factory):
     b = book_factory("kalshi", yes_asks=[(.60, 10)], no_asks=[(.42, 10)])    # NO entry .42, NO bid = 1 - .60 = .40
     c = round_trip_cost(b, "no")
     assert (c["entry"], c["exit_bid"], c["spread"]) == (.42, .40, .02) and cost_block(b, "no") is None
-    assert cost_block(book_factory("kalshi", no_asks=[(.42, 10)]), "no") is None   # no bid: left to the fill guard
+    assert cost_block(book_factory("kalshi", no_asks=[(.42, 10)]), "no") == "no_exit_liquidity"   # no bid: nobody to sell to
 
 
 def test_cost_block_empty_book_abstains(book_factory):
@@ -108,3 +110,26 @@ def test_crossed_book_spread_is_clamped_to_zero(book_factory):
     b = book_factory("kalshi", yes_asks=[(.50, 10)], no_asks=[(.45, 10)])   # yes bid .55 > yes ask .50
     c = round_trip_cost(b, "yes")
     assert c["spread"] == 0.0 and c["cost"] >= 0
+
+
+def test_no_exit_liquidity_boundaries(book_factory):
+    assert cost_block(book_factory("kalshi", yes_asks=[(.55, 10)]), "yes") == "no_exit_liquidity"                        # no bid
+    assert cost_block(book_factory("kalshi", yes_asks=[(.55, 10)], no_asks=[(1.0, 10)]), "yes") == "no_exit_liquidity"   # bid 0
+    assert cost_block(book_factory("polymarket", yes_asks=[(.04, 10)], no_asks=[(.99, 10)]), "yes") is None              # bid .01
+    assert cost_block(book_factory("kalshi", no_asks=[(.01, 20000)]), "no") == "no_exit_liquidity"                       # the live incident: 1c NO, no bid
+
+
+def test_longshot_boundary(book_factory):
+    assert cost_block(book_factory("polymarket", yes_asks=[(.03, 10)], no_asks=[(.98, 10)]), "yes") is None          # exactly 3c allowed
+    assert cost_block(book_factory("polymarket", yes_asks=[(.029, 10)], no_asks=[(.98, 10)]), "yes") == "longshot"
+    assert cost_block(book_factory("polymarket", yes_asks=[(.029, 10)], no_asks=[(.98, 10)]), "yes", min_entry=.02) is None
+    assert books.COST_BLOCK_REASONS == {"too_expensive", "no_exit_liquidity", "longshot"}
+
+
+def test_cost_block_precedence_and_no_ask_abstains(book_factory):
+    # 1c entry with no bid: no_exit_liquidity wins over longshot
+    assert cost_block(book_factory("kalshi", yes_asks=[(.01, 10)]), "yes") == "no_exit_liquidity"
+    # 2c entry with a 0.01 bid on polymarket: longshot wins over cost checks
+    assert cost_block(book_factory("polymarket", yes_asks=[(.02, 10)], no_asks=[(.99, 10)]), "yes") == "longshot"
+    # held side has no ask at all: abstain (no_fill_within_limit is reported later)
+    assert cost_block(book_factory("kalshi", no_asks=[(.4, 10)]), "yes") is None

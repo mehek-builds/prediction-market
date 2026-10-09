@@ -27,7 +27,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastlane import errors, live
 from fastlane.books import fetch_book, taker_fee_per_contract
 from fastlane.decision import BUCKET_EDGES, strength_bucket
-from fastlane.ledger import DB_PATH, SCHEMA, columns, mark_key
+from fastlane.ledger import DB_PATH, SCHEMA, columns, mark_key, utc_day
 from fastlane.ratelimit import RateLimitMiddleware
 from fastlane.universe import CACHE
 
@@ -302,7 +302,59 @@ def _decisions(db: sqlite3.Connection, limit: int) -> dict:
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "ledger": DB_PATH.exists()}
+    db = _db()
+    try:
+        return {"ok": True, "ledger": DB_PATH.exists(), **_sources(db)}
+    finally:
+        db.close()
+
+
+STALE_STATUS_S = 120
+
+
+def _sources(db: sqlite3.Connection) -> dict:
+    """x: calls and spend for today's UTC day from x_spend, flags from feed_status('x'); bluesky: from feed_status.
+
+    A ledger from before 0.3.0 (opened read-only, not yet migrated by the engine) has neither table: return defaults.
+    A feed_status row older than STALE_STATUS_S (120) counts as not connected (the engine is not running).
+    x.enabled reports configuration (the key is set), so it stays true through a long error backoff; x.budget_hit and
+    x.in_window are heartbeat-based and read false when the row is stale.
+    """
+    x = {"enabled": False, "calls_today": 0, "spend_today_usd": 0.0, "budget_hit": False, "in_window": False,
+         "updated_ts": None}
+    b = {"connected": False, "mode": None, "updated_ts": None}
+
+    def status(name):
+        try:
+            row = db.execute("SELECT connected, updated_ts, info FROM feed_status WHERE name = ?", (name,)).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if not row:
+            return None
+        try:
+            info = json.loads(row[2] or "{}")
+        except ValueError:
+            info = {}
+        fresh = row[1] is not None and time.time() - row[1] <= STALE_STATUS_S
+        return bool(row[0]) and fresh, row[1], info if isinstance(info, dict) else {}
+
+    try:
+        row = db.execute("SELECT calls, usd FROM x_spend WHERE day = ?", (utc_day(),)).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row:
+        x["calls_today"], x["spend_today_usd"] = int(row[0]), float(row[1])
+    sx = status("x")
+    if sx:
+        _, ts, info = sx
+        fresh = ts is not None and time.time() - ts <= STALE_STATUS_S
+        x.update(enabled=bool(info.get("enabled")), budget_hit=bool(info.get("budget_hit")) and fresh,
+                 in_window=bool(info.get("in_window")) and fresh, updated_ts=ts)
+    sb = status("bsky")
+    if sb:
+        conn, ts, info = sb
+        b.update(connected=conn, mode=info.get("mode"), updated_ts=ts)
+    return {"x": x, "bluesky": b}
 
 
 # ---------- the paper / real-money switch ----------

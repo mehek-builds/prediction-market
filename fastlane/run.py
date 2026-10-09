@@ -54,6 +54,15 @@ if __name__ == "__main__":
     args = ap.parse_args()
     if not os.environ.get("OPENROUTER_API_KEY", "").strip():
         sys.exit("OPENROUTER_API_KEY is not set. Copy .env.example to .env and fill it in.")
+    from fastlane.kalshi_tape import move_deny_re
+    from fastlane.bluesky import bsky_settings
+    from fastlane.x_feed import x_settings
+    try:
+        x_settings()        # XAI_* validation (None when the key is unset: feature off)
+        bsky_settings()     # BSKY_* validation
+        move_deny_re()      # MOVE_DENY_RE must compile
+    except ValueError as exc:
+        sys.exit(str(exc))
     errors.init("engine")
     try:
         asyncio.run(main(args))

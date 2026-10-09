@@ -1,4 +1,8 @@
-from fastlane.ledger import Ledger, columns, mark_key
+import time
+
+import pytest
+
+from fastlane.ledger import Ledger, columns, mark_key, utc_day
 
 
 def test_old_ledger_migrates_on_open(old_ledger_path):
@@ -35,3 +39,31 @@ def test_marks_event_index_created_and_idempotent(tmp_path, old_ledger_path):
         led = Ledger(path)
         idx = [r[1] for r in led.db.execute("PRAGMA index_list(marks)")]
         assert "marks_event" in idx
+
+
+def test_new_tables_on_fresh_and_old_ledgers(tmp_ledger, old_ledger_path):
+    for L in (tmp_ledger, Ledger(old_ledger_path)):
+        assert {"day", "calls", "usd", "posts"} == columns(L.db, "x_spend")
+        assert {"name", "connected", "updated_ts", "info"} == columns(L.db, "feed_status")
+
+
+def test_x_spend_accumulates_and_persists(tmp_path):
+    L = Ledger(tmp_path / "l.db")
+    L.x_spend_add("2026-10-09", 0.055); L.x_spend_add("2026-10-09", 0.06, posts=3); L.x_spend_add("2026-10-10", 0.01)
+    assert L.x_spend("2026-10-09") == (2, pytest.approx(0.115)) and L.x_spend("2026-10-11") == (0, 0.0)
+    assert Ledger(tmp_path / "l.db").x_spend("2026-10-09")[0] == 2
+
+
+def test_feed_status_roundtrip(tmp_ledger):
+    assert tmp_ledger.feed_status("bsky") is None
+    tmp_ledger.feed_status_set("bsky", True, {"mode": "ws"})
+    s = tmp_ledger.feed_status("bsky")
+    assert s["connected"] is True and s["info"] == {"mode": "ws"} and abs(s["updated_ts"] - time.time()) < 5
+    tmp_ledger.feed_status_set("bsky", False)
+    assert tmp_ledger.feed_status("bsky")["connected"] is False and tmp_ledger.feed_status("bsky")["info"] == {}
+
+
+def test_utc_day():
+    assert utc_day(1_700_000_000) == "2023-11-14"
+    midnight = 1_699_920_000                       # 2023-11-14 00:00:00 UTC
+    assert utc_day(midnight - 1) == "2023-11-13" and utc_day(midnight) == "2023-11-14"
