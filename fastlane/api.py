@@ -3,34 +3,61 @@
     uvicorn fastlane.api:app --port 8787
 
 GET /trades  -> every paper trade with its trigger, decision timings, live sell price, P&L and price path since entry.
+GET /control/state, POST /control/mode -> the paper / real-money switch (localhost only, see fastlane/live.py).
+
+Every other route is read-only. Errors return a plain {"error": "internal"} 500, never a stack trace.
 """
 import asyncio
+import hmac
 import json
 import os
+import secrets
 import sqlite3
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from fastlane import errors, live
 from fastlane.books import fetch_book, taker_fee_per_contract
 from fastlane.decision import BUCKET_EDGES, strength_bucket
 from fastlane.ledger import DB_PATH, SCHEMA, columns, mark_key
+from fastlane.ratelimit import RateLimitMiddleware
 from fastlane.universe import CACHE
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+HOSTED = os.environ.get("FASTLANE_HOSTED", "").strip() == "1"  # the Vercel copy: read-only snapshot, no switch
+CONTROL_TOKEN = secrets.token_urlsafe(24)  # per process; only same-origin pages can read it (no CORS headers)
 
-app = FastAPI(title="fastlane")
+
+@asynccontextmanager
+async def lifespan(_app):
+    if not HOSTED:  # the hosted copy starts reporting in hosted.py, with the choice recorded at deploy time
+        errors.init("api")
+    yield
+    errors.flush()
+
+
+app = FastAPI(title="fastlane", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.exception_handler(Exception)
+async def internal_error(request: Request, exc: Exception):
+    errors.capture(exc, f"api {request.url.path}")
+    return JSONResponse({"error": "internal"}, status_code=500)
+
 
 # Reject unexpected Host headers (DNS rebinding). "testserver" is the Starlette test client's host.
 ALLOWED_HOSTS = ["localhost", "127.0.0.1", "testserver"] + [
     h.strip() for h in os.environ.get("FASTLANE_ALLOWED_HOSTS", "").split(",") if h.strip()]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+app.add_middleware(RateLimitMiddleware)  # added last, so it runs first: a flood is turned away before any work
 
 BOOK_TTL_S = 3.0
 _http: httpx.AsyncClient | None = None
@@ -276,3 +303,79 @@ def _decisions(db: sqlite3.Connection, limit: int) -> dict:
 @app.get("/health")
 async def health():
     return {"ok": True, "ledger": DB_PATH.exists()}
+
+
+# ---------- the paper / real-money switch ----------
+def _live_orders(db: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    if "status" not in columns(db, "live_orders"):
+        return []
+    rows = db.execute("SELECT ts, market_id, side, contracts, limit_price, status, fill_count, avg_price, cost, fee, "
+                      "error FROM live_orders ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def control_state() -> dict:
+    eng, mode = live.read_engine(), live.read_mode()
+    alive = live.engine_alive(eng)
+    is_live = (not HOSTED and alive and mode.get("mode") == "live" and mode.get("session") == eng.get("session")
+               and eng.get("live_enabled") and eng.get("kalshi_configured"))
+    db = _db()
+    try:
+        orders = _live_orders(db)
+    finally:
+        db.close()
+    out = {"mode": "live" if is_live else "paper", "hosted": HOSTED, "engine_running": alive,
+           "session": eng.get("session") if alive and not HOSTED else None,
+           "live_enabled": bool(eng.get("live_enabled")), "kalshi_configured": bool(eng.get("kalshi_configured")),
+           "limits": eng.get("limits") or live.limits(), "balance_usd": eng.get("balance_usd"),
+           "spent_today_usd": eng.get("spent_today_usd"), "last_error": eng.get("last_error"),
+           "last_switch": {k: mode.get(k) for k in ("mode", "ts", "reason")} if mode else None,
+           "confirm_phrase": live.CONFIRM_PHRASE, "orders": orders}
+    if HOSTED:
+        try:
+            out["snapshot_ts"] = json.loads((Path(__file__).resolve().parent / "hosted_meta.json").read_text())["snapshot_ts"]
+        except (OSError, ValueError, KeyError):
+            out["snapshot_ts"] = None
+    else:
+        out["token"] = CONTROL_TOKEN
+    return out
+
+
+@app.get("/control/state")
+async def control_get():
+    return control_state()
+
+
+@app.post("/control/mode")
+async def control_mode(request: Request):
+    """Flip between paper and real. Paper always works. Real needs the engine running with LIVE_TRADING_ENABLED=1
+    and a Kalshi key, this process's token (so another website cannot do it), and the exact confirmation phrase."""
+    if HOSTED:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    origin = request.headers.get("origin")
+    if origin and origin.split("://", 1)[-1] != request.headers.get("host", ""):
+        return JSONResponse({"error": "cross_origin"}, status_code=403)
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "bad_json"}, status_code=400)
+    want = body.get("mode") if isinstance(body, dict) else None
+    eng = live.read_engine()
+    if want == "paper":  # always allowed, no token: forcing paper is harmless, and it must work even with a stale page
+        live.set_paper("dashboard", session=eng.get("session"))
+        return control_state()
+    if want != "live":
+        return JSONResponse({"error": "mode must be paper or live"}, status_code=400)
+    if not hmac.compare_digest(request.headers.get("x-fastlane-token", ""), CONTROL_TOKEN):
+        return JSONResponse({"error": "bad_token"}, status_code=403)
+    problems = [p for ok, p in [
+        (live.engine_alive(eng), "the engine is not running (python3 -m fastlane.run)"),
+        (body.get("session") == eng.get("session"), "the engine restarted since this page loaded; reload and confirm again"),
+        (eng.get("live_enabled"), "LIVE_TRADING_ENABLED=1 is not set in .env (restart the engine after setting it)"),
+        (eng.get("kalshi_configured"), "no Kalshi API key (KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH)"),
+        (body.get("confirm") == live.CONFIRM_PHRASE, f'type "{live.CONFIRM_PHRASE}" exactly to confirm'),
+    ] if not ok]
+    if problems:
+        return JSONResponse({"error": "not_armed", "problems": problems}, status_code=409)
+    live.arm(eng["session"])
+    return control_state()

@@ -3,6 +3,9 @@
     python3 -m fastlane.run                     # live, forever (Ctrl-C to stop)
     python3 -m fastlane.run --minutes 30        # live for 30 minutes
     python3 -m fastlane.run --inject "Fed cuts rates by 50 bps" --minutes 2   # synthetic end-to-end test
+    python3 -m fastlane.run --vercel            # also keep a password-protected copy of the dashboard on Vercel
+
+Every start is on paper. Real Kalshi orders need LIVE_TRADING_ENABLED=1 and the dashboard switch (fastlane/live.py).
 """
 import argparse
 import asyncio
@@ -15,12 +18,18 @@ from fastlane.config import load_env
 
 load_env()
 
+from fastlane import errors  # noqa: E402
 from fastlane.engine import Engine  # noqa: E402
 
 
 async def main(a):
+    errors.install_hooks(asyncio.get_running_loop())
+    print(errors.notice())
     eng = Engine(workers=a.workers)
     await eng.start(feeds=not a.inject)
+    if a.vercel:
+        from fastlane import deploy
+        deploy.start_background(a.vercel)
     try:
         for text in a.inject or []:
             ev = {"id": "syn-" + hashlib.sha1(f"{text}{time.time()}".encode()).hexdigest()[:12],
@@ -40,10 +49,15 @@ if __name__ == "__main__":
     ap.add_argument("--minutes", type=float, default=0)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--inject", action="append", help="synthetic headline (repeatable); disables live feeds")
+    ap.add_argument("--vercel", type=float, nargs="?", const=30, metavar="MINUTES",
+                    help="keep the Vercel dashboard in sync every MINUTES (default 30); run fastlane.deploy once first")
     args = ap.parse_args()
     if not os.environ.get("OPENROUTER_API_KEY", "").strip():
         sys.exit("OPENROUTER_API_KEY is not set. Copy .env.example to .env and fill it in.")
+    errors.init("engine")
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:
         pass
+    finally:
+        errors.flush()

@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Real trading on Kalshi, opt-in (`fastlane/live.py`). Off unless `LIVE_TRADING_ENABLED=1` and the dashboard switch is
+  flipped with the typed confirmation `TRADE REAL MONEY`; every engine start resets to paper. Immediate-or-cancel
+  buys only (Create Order V2), at the paper fill's limit, capped by `LIVE_MAX_ORDER_USD`, `LIVE_MAX_DAILY_USD`,
+  `LIVE_MAX_ORDERS_PER_HOUR` and one position per market. Trips back to paper on a restart, an auth error or three
+  failed orders. Kill switch: `python3 -m fastlane.live paper`. Ledger table `live_orders`.
+- API: `GET /control/state` and `POST /control/mode` (per-process token, same-origin, rate limited). Dashboard mode
+  bar, confirmation panel, REAL MONEY banner and a real-orders table.
+- Rate limits: per-client token bucket on the API (`API_RATE_LIMIT_PER_MIN`, HTTP 429 + `Retry-After`) and a Jev
+  budget (`JEV_MAX_CALLS_PER_HOUR`, `JEV_MAX_USD_PER_DAY`; decisions logged as `PASS jev_hourly_cap` /
+  `jev_daily_spend_cap`).
+- Error reports (`fastlane/errors.py`): `fastlane/results/errors.log` on every install, plus scrubbed crash reports
+  to the maintainer's Sentry (opt out `FASTLANE_TELEMETRY=0`, or your own `FASTLANE_SENTRY_DSN`). New dependency
+  `sentry-sdk`.
+- Backups (`fastlane/backup.py`): scheduled (`BACKUP_EVERY_HOURS`) and on shutdown, gzipped with a row-count manifest;
+  `--verify` restore drill, `--restore`, pruning (`BACKUP_KEEP`), off-machine `BACKUP_DIR`.
+- Vercel (`fastlane/deploy.py`, `fastlane/hosted.py`): `python3 -m fastlane.deploy` puts a password-protected,
+  read-only copy of the dashboard on the user's own Vercel account; `fastlane.run --vercel` keeps it in sync.
+- `ROLLBACK.md`: the launch-day rollback plan.
+
+### Changed
+- API errors return `{"error": "internal"}` with no stack trace; `/docs` and `/openapi.json` are off.
+- `tests/test_no_orders.py` now allows exactly one order endpoint, in `fastlane/live.py`, and still forbids cancel,
+  amend, batch and sell-to-close code everywhere.
+
 ## 0.2.0 - 2026-10-09
 
 ### Added

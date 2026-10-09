@@ -75,16 +75,35 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .chip.traded { color: var(--amber); }
 .mv { font-size: 10px; margin-top: 2px; }
 code { color: var(--amber); }
+/* paper / real switch */
+.modebar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px; }
+.badge { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--amber); color: var(--amber); }
+.badge.real { border-color: var(--red); background: var(--red); color: #fff; }
+.modebar .msg { flex: 1; min-width: 220px; font-size: 12px; color: var(--text-2); }
+.btn { font: inherit; font-size: 11px; font-weight: 600; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--card); color: var(--text); cursor: pointer; min-height: 32px; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.danger { border-color: var(--red); color: var(--red); }
+.btn.solid-danger { background: var(--red); border-color: var(--red); color: #fff; }
+.panel.live { border-color: var(--red); box-shadow: inset 0 0 0 1px var(--red); }
+.arm { border-top: 1px solid var(--border); padding: 10px; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.arm ul { margin: 0; padding-left: 18px; color: var(--text-2); line-height: 1.6; }
+.arm input { font: inherit; font-size: 13px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--bg); color: var(--text); max-width: 260px; }
+.arm .err { color: var(--red); }
+.orders { border-top: 1px solid var(--border); overflow-x: auto; }
+.orders table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.orders th, .orders td { text-align: left; padding: 5px 10px; border-top: 1px solid var(--border); white-space: nowrap; }
+.orders th { font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
 <body>
 <div id="app">
   <section class="panel">
-    <div class="hdr"><h2>Fast lane · paper trades</h2><span class="right" id="updated">loading</span></div>
+    <div class="hdr"><h2 id="apptitle">Fast lane · paper trades</h2><span class="right" id="updated">loading</span></div>
     <div class="stats" id="stats" aria-live="polite"></div>
     <div id="buckets"></div>
   </section>
+  <section class="panel" id="mode" aria-live="polite"></section>
   <div class="controls" id="controls"></div>
   <div id="notice"></div>
   <div class="grid" id="cards"></div>
@@ -107,7 +126,8 @@ const REASONS = {
 };
 const SVGNS = "http://www.w3.org/2000/svg";
 const BUCKET_ORDER = ["<0.60", "0.60-0.70", "0.70-0.85", "0.85+", "unknown"];
-const state = { data: null, decisions: [], error: false, filter: "live", sort: "newest", now: Date.now() / 1000 };
+const state = { data: null, decisions: [], error: false, filter: "live", sort: "newest", now: Date.now() / 1000,
+  control: null, arming: false, armError: null, busy: false };
 
 // ---- formatting ----
 const cents = p => (p == null ? "--" : Math.round(p * 100) + "¢");
@@ -431,6 +451,126 @@ function render() {
   }
 }
 
+// ---- paper / real switch ----
+async function setMode(mode, confirm) {
+  const c = state.control;
+  if (!c || !c.token || state.busy) return;
+  state.busy = true; state.armError = null; renderMode();
+  try {
+    const r = await fetch("/control/mode", { method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Fastlane-Token": c.token },
+      body: JSON.stringify({ mode, confirm, session: c.session }) });
+    const j = await r.json();
+    if (r.ok) { state.control = j; state.arming = false; }
+    else state.armError = (j.problems || [j.error || ("HTTP " + r.status)]).join(" · ");
+  } catch (e) {
+    state.armError = "Could not reach the API.";
+  }
+  state.busy = false;
+  renderMode();
+}
+
+function renderMode() {
+  const box = document.getElementById("mode");
+  const c = state.control;
+  box.replaceChildren();
+  if (!c) { box.hidden = true; return; }
+  box.hidden = false;
+  const real = c.mode === "live";
+  box.className = "panel" + (real ? " live" : "");
+  document.title = real ? "Fast lane · REAL MONEY" : "Fast lane · paper trades";
+  document.getElementById("apptitle").textContent = document.title;
+  const bar = el("div", "modebar");
+  bar.append(el("span", "badge" + (real ? " real" : ""), real ? "REAL MONEY" : "PAPER"));
+  const lim = c.limits || {};
+  const capText = "max " + money(lim.max_order_usd || 0, 2) + " per order, " + money(lim.max_daily_usd || 0, 2) +
+    " per day, " + (lim.max_orders_per_hour || 0) + " orders an hour";
+  let msg;
+  if (c.hosted) {
+    msg = "Read-only copy on Vercel" + (c.snapshot_ts ? ", snapshot from " + ago(c.snapshot_ts, state.now) : "") +
+      ". Real trading can only be switched on from the dashboard on your own machine.";
+  } else if (real) {
+    msg = "Kalshi orders are being sent with real money. Spent today " + money(c.spent_today_usd || 0, 2) +
+      " of " + money(lim.max_daily_usd || 0, 2) + (c.balance_usd != null ? " · Kalshi balance " + money(c.balance_usd, 2) : "") +
+      ". Positions are held to settlement; close them on kalshi.com.";
+  } else if (!c.engine_running) {
+    msg = "Paper trading. The engine is not running (python3 -m fastlane.run), so the real-money switch is unavailable.";
+  } else if (!c.live_enabled) {
+    msg = "Paper trading. Real trading is off: set LIVE_TRADING_ENABLED=1 in .env and restart the engine to allow it.";
+  } else if (!c.kalshi_configured) {
+    msg = "Paper trading. Real trading needs a Kalshi API key with trading permission in .env.";
+  } else {
+    msg = "Paper trading. Real trading is allowed on this machine (" + capText + ").";
+  }
+  bar.append(el("div", "msg", msg));
+  if (!c.hosted) {
+    if (real) {
+      const b = el("button", "btn solid-danger", state.busy ? "Switching" : "Back to paper", { type: "button" });
+      b.disabled = state.busy;
+      b.addEventListener("click", () => setMode("paper"));
+      bar.append(b);
+    } else if (c.engine_running && c.live_enabled && c.kalshi_configured && !state.arming) {
+      const b = el("button", "btn danger", "Switch to real trading", { type: "button" });
+      b.addEventListener("click", () => { state.arming = true; state.armError = null; renderMode(); });
+      bar.append(b);
+    }
+  }
+  box.append(bar);
+
+  if (state.arming && !real && !c.hosted) {
+    const arm = el("div", "arm");
+    arm.append(el("div", null, "Real money. Read this before you switch:"));
+    const ul = el("ul");
+    for (const t of [
+      "Every trade the engine takes from now on is also sent to Kalshi as a real immediate-or-cancel buy.",
+      "Hard caps: " + capText + ", one real position per market.",
+      "The bot only buys. It never sells or closes; positions are held to settlement unless you close them on kalshi.com.",
+      "Kalshi nets YES and NO in one market: a bot buy offsets a position you opened by hand in the same market.",
+      "Kalshi markets only. Polymarket, shadow and test trades stay on paper.",
+      "A restart, an auth error, or three failed orders in a row puts it back on paper.",
+      "Paper results do not predict real results. You can lose the money you trade. This is not financial advice.",
+    ]) ul.append(el("li", null, t));
+    arm.append(ul);
+    const lbl = el("label", null, "Type " + c.confirm_phrase + " to confirm");
+    const input = el("input", "num", null, { type: "text", autocomplete: "off", spellcheck: "false", "aria-label": "Confirmation phrase" });
+    const go = el("button", "btn solid-danger", "Switch to REAL", { type: "button" });
+    go.disabled = true;
+    input.addEventListener("input", () => { go.disabled = input.value !== c.confirm_phrase || state.busy; });
+    go.addEventListener("click", () => setMode("live", input.value));
+    const cancel = el("button", "btn", "Stay on paper", { type: "button" });
+    cancel.addEventListener("click", () => { state.arming = false; state.armError = null; renderMode(); });
+    const row = el("div", "row"); row.style.flexWrap = "wrap"; row.append(input, go, cancel);
+    arm.append(lbl, row);
+    if (state.armError) arm.append(el("div", "err", state.armError));
+    box.append(arm);
+  } else if (state.armError) {
+    const e = el("div", "arm err", state.armError);
+    box.append(e);
+  }
+
+  if ((c.orders || []).length) {
+    const wrap = el("div", "orders");
+    const t = el("table");
+    const head = el("tr");
+    for (const h of ["When", "Market", "Side", "Qty", "Limit", "Status", "Filled", "Cost + fee"]) head.append(el("th", null, h));
+    t.append(head);
+    for (const o of c.orders) {
+      const tr = el("tr");
+      tr.append(el("td", null, ago(o.ts, state.now)), el("td", "num", o.market_id), el("td", null, String(o.side).toUpperCase()),
+        el("td", "num", String(o.contracts)), el("td", "num", cents(o.limit_price)),
+        el("td", o.status === "filled" ? "pos" : o.status === "error" || o.status === "unknown" ? "neg" : "secondary",
+          o.status + (o.error ? " (" + o.error + ")" : "")),
+        el("td", "num", o.fill_count == null ? "--" : String(o.fill_count)),
+        el("td", "num", o.cost == null ? "--" : money((o.cost || 0) + (o.fee || 0), 2)));
+      t.append(tr);
+    }
+    const hd = el("div", "hdr");
+    hd.append(el("h2", null, "Real Kalshi orders"));
+    wrap.append(hd, t);
+    box.append(wrap);
+  }
+}
+
 function tickClock() {
   state.now = Date.now() / 1000;
   document.querySelectorAll("[data-ts]").forEach(n => { n.textContent = ago(Number(n.getAttribute("data-ts")), state.now); });
@@ -441,10 +581,12 @@ function tickClock() {
 
 async function load() {
   try {
-    const [r, rd] = await Promise.all([
+    const [r, rd, rc] = await Promise.all([
       fetch("/trades", { cache: "no-store" }),
       fetch("/decisions?limit=40", { cache: "no-store" }),
+      fetch("/control/state", { cache: "no-store" }).catch(() => null),
     ]);
+    if (rc && rc.ok) state.control = await rc.json();
     if (!r.ok) throw new Error("HTTP " + r.status);
     const j = await r.json();
     const jd = rd.ok ? await rd.json() : { decisions: [] };
@@ -454,6 +596,7 @@ async function load() {
   }
   state.now = Date.now() / 1000;
   render();
+  if (!state.busy && !state.arming) renderMode();  // never wipe the confirmation box while it is being typed into
 }
 
 render();

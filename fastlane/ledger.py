@@ -37,7 +37,17 @@ CREATE TABLE IF NOT EXISTS marks (
     event_id TEXT, horizon_s INTEGER, ts REAL, yes_ask REAL, yes_bid REAL, mid REAL,
     PRIMARY KEY (event_id, horizon_s)
 );
+-- Real Kalshi orders (live.py). Empty unless the user turned real trading on. One row per attempt, written before
+-- the order is sent; status: sending | filled | no_fill | duplicate | error | unknown | skipped_too_small.
+CREATE TABLE IF NOT EXISTS live_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, ts REAL, market_id TEXT, side TEXT, contracts REAL,
+    limit_price REAL, client_order_id TEXT UNIQUE, order_id TEXT, status TEXT, fill_count REAL, avg_price REAL,
+    cost REAL, fee REAL, error TEXT
+);
 """
+
+# A real order whose outcome is not known yet (or never will be) counts against the caps at its full limit cost.
+LIVE_PENDING = ("sending", "unknown", "duplicate")
 
 MIGRATIONS = [  # (table, column, type): added to ledgers created before the column existed
     ("decisions", "mid_at_published", "REAL"), ("decisions", "mid_at_seen", "REAL"),
@@ -69,6 +79,7 @@ def columns(db: sqlite3.Connection, table: str) -> set[str]:
 class Ledger:
     def __init__(self, path: Path = DB_PATH):
         path.parent.mkdir(exist_ok=True)
+        self.path = path
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
@@ -116,3 +127,31 @@ class Ledger:
         start = time.time() - 86400
         return self.db.execute("SELECT COALESCE(SUM(cost + fee), 0) FROM trades WHERE opened_ts > ? AND synthetic = 0 AND shadow = 0",
                                (start,)).fetchone()[0]
+
+    # ---------- real orders (live.py) ----------
+    def live_order(self, **o):
+        cols = list(o.keys())
+        self.db.execute(f"INSERT OR IGNORE INTO live_orders ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                        tuple(o.values()))
+
+    def live_order_update(self, client_order_id: str, **o):
+        sets = ", ".join(f"{k} = ?" for k in o)
+        self.db.execute(f"UPDATE live_orders SET {sets} WHERE client_order_id = ?", (*o.values(), client_order_id))
+
+    def live_markets(self) -> set[str]:
+        """Markets with any real order that may hold a position (failed-before-sending rows excluded)."""
+        return {r[0] for r in self.db.execute(
+            "SELECT market_id FROM live_orders WHERE status IN ('filled', 'duplicate', 'sending', 'unknown')")}
+
+    def live_orders_last_hour(self, now: float | None = None) -> int:
+        now = time.time() if now is None else now
+        return self.db.execute("SELECT COUNT(*) FROM live_orders WHERE ts > ? AND status != 'skipped_too_small'",
+                               (now - 3600,)).fetchone()[0]
+
+    def live_spent_today(self, now: float | None = None) -> float:
+        now = time.time() if now is None else now
+        q = f"""SELECT COALESCE(SUM(CASE WHEN status IN ({",".join("?" * len(LIVE_PENDING))})
+                        THEN contracts * (limit_price + 0.07 * limit_price * (1 - limit_price))
+                        ELSE COALESCE(cost, 0) + COALESCE(fee, 0) END), 0)
+                FROM live_orders WHERE ts > ?"""
+        return self.db.execute(q, (*LIVE_PENDING, now - 86400)).fetchone()[0]

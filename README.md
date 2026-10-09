@@ -1,14 +1,16 @@
 # prediction-market
 
-A paper-only, news-driven trading research bot for Kalshi and Polymarket. It reads headlines, matches them to open
-markets, asks a decision model one typed question per candidate market, applies a fixed trade rule, and simulates a
-fill against the live order book. Nothing is ever sent to an exchange: there is no order-placing code anywhere in
-this repository, and a test enforces that.
+A news-driven trading research bot for Kalshi and Polymarket. It reads headlines, matches them to open markets, asks a
+decision model one typed question per candidate market, applies a fixed trade rule, and simulates a fill against the
+live order book. **It always starts on paper.** Real Kalshi orders are opt-in: you enable them in `.env`, then flip a
+switch in the dashboard each session (see [Real trading](#real-trading-opt-in)). The only order code is one
+immediate-or-cancel buy in `fastlane/live.py`, and a test enforces that.
 
-> **Disclaimer.** This is educational and research software. It trades on paper only, forever. It is not financial
-> advice. It comes with no warranty (see AGPL-3.0 sections 15 and 16). You are responsible for checking the Kalshi
-> and Polymarket terms of service and your own eligibility in your jurisdiction. Do not use VPNs or any other means
-> to evade geo-restrictions. Prediction markets may be restricted or illegal where you live.
+> **Disclaimer.** This is educational and research software. It is not financial advice. Paper results do not predict
+> real results, and if you turn real trading on you can lose the money you trade. It comes with no warranty (see
+> AGPL-3.0 sections 15 and 16). You are responsible for checking the Kalshi and Polymarket terms of service and your
+> own eligibility in your jurisdiction. Do not use VPNs or any other means to evade geo-restrictions. Prediction
+> markets may be restricted or illegal where you live.
 
 Requires Python >= 3.11.
 
@@ -37,8 +39,13 @@ news pollers (17 RSS feeds + SEC 8-K)   +   Kalshi live tape (WebSocket, optiona
 | `fastlane/kalshi_tape.py` | Live Kalshi quotes: price-at-publish-time, first reaction time, and the move detector. |
 | `fastlane/report.py` | Stage latencies, source lag, decisions, market moves after news, mark-to-bid P&L. |
 | `fastlane/bench_jev.py` | Standalone Jev benchmark. |
-| `fastlane/api.py` | Read-only FastAPI over the ledger (`GET` routes only). |
+| `fastlane/api.py` | FastAPI over the ledger: read-only `GET` routes plus one `POST /control/mode` (the paper/real switch). |
 | `fastlane/static/index.html` | Single-file dashboard served at `/`, no external requests. |
+| `fastlane/live.py` | Real Kalshi orders: off by default, paper after every restart, hard caps, IOC buys only. |
+| `fastlane/ratelimit.py` | Per-client API rate limits and the Jev call/spend budget. |
+| `fastlane/errors.py` | Local error log plus scrubbed crash reports (Sentry). |
+| `fastlane/backup.py` | Ledger backups, restore and the restore drill. |
+| `fastlane/deploy.py`, `hosted.py` | Password-protected read-only copy of the dashboard on your own Vercel account. |
 
 ## Quick start
 
@@ -71,6 +78,18 @@ Environment variables (see `.env.example`):
 | `SHADOW_SIGNAL_THRESHOLD` | optional | Shadow rule signal threshold, default 0.60 (real rule: 0.85, unchanged). |
 | `SHADOW_DECISIVE_MIN` | optional | Shadow rule decisive minimum, default 0.0 (real rule: 0.30, unchanged). |
 | `FASTLANE_ALLOWED_HOSTS` | optional | Extra Host header values the dashboard API accepts (comma separated). `localhost` and `127.0.0.1` are always allowed; other Hosts get HTTP 400 (DNS rebinding guard). |
+| `LIVE_TRADING_ENABLED` | optional | `1` allows the dashboard's real-money switch. Off by default. See [Real trading](#real-trading-opt-in). |
+| `LIVE_MAX_ORDER_USD` | optional | Real trading: most one order may cost, fees included. Default 5. |
+| `LIVE_MAX_DAILY_USD` | optional | Real trading: most spent in any 24 hours. Default 25. |
+| `LIVE_MAX_ORDERS_PER_HOUR` | optional | Real trading: order rate cap. Default 6. |
+| `JEV_MAX_CALLS_PER_HOUR` | optional | Jev calls allowed per rolling hour; over it, headlines are logged as `PASS jev_hourly_cap`. Default 600. `0` turns the cap off. |
+| `JEV_MAX_USD_PER_DAY` | optional | Jev spend allowed per rolling 24 h (from OpenRouter's reported cost); over it, `PASS jev_daily_spend_cap`. Default 5. |
+| `API_RATE_LIMIT_PER_MIN` | optional | Dashboard API requests per minute per client (HTTP 429 beyond). Default 120, burst `API_RATE_LIMIT_BURST` 60. |
+| `BACKUP_EVERY_HOURS` | optional | Engine backs the ledger up this often, and on clean shutdown. Default 6, `0` turns scheduled backups off. |
+| `BACKUP_DIR` | optional | Where backups go. Default `fastlane/results/backups`. Point it at a synced folder to survive a dead disk. |
+| `BACKUP_KEEP` | optional | Backups kept. Default 28. |
+| `FASTLANE_TELEMETRY` | optional | `0` stops crash reports to the maintainer. See [Error reports](#error-reports). |
+| `FASTLANE_SENTRY_DSN` | optional | Send crash reports to your own Sentry project instead. |
 
 What is disabled when the optional ones are empty:
 
@@ -90,6 +109,10 @@ python3 -m fastlane.bench_jev --n 200 --repeats 3 --concurrency 4   # Jev latenc
 python3 -m fastlane.bench_jev --dry-run          # sources only, no Jev calls, no key needed
 python3 -m uvicorn fastlane.api:app --port 8787  # dashboard and JSON API
 python3 -m pytest -q                             # tests (offline, no keys)
+python3 -m fastlane.backup                       # back up the ledger now (--list, --verify, --restore PATH --yes)
+python3 -m fastlane.deploy                       # put a password-protected copy of the dashboard on Vercel
+python3 -m fastlane.run --vercel                 # run the engine and keep the Vercel copy in sync
+python3 -m fastlane.live paper                   # kill switch: back to paper right now
 ```
 
 Docker (the Dockerfile header has the same commands):
@@ -121,6 +144,78 @@ round-trip cost (that spread plus the entry and exit Kalshi taker fees per contr
 unchanged. Room in the cost filter comes from the live book (1 minus best ask), not the cached quote used for ranking.
 The filter runs after selection, so when the chosen market is too expensive a cheaper second qualifier is not picked
 (the market is still tracked).
+
+## Real trading (opt-in)
+
+Every install starts on paper, and every engine start resets to paper. To allow real Kalshi orders:
+
+1. Create a Kalshi API key **with trading permission** and set `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH`.
+2. Set `LIVE_TRADING_ENABLED=1` (and, if you want, tighter `LIVE_MAX_*` caps) in `.env`, then start the engine.
+3. In the dashboard, press **Switch to real trading**, read the terms, and type `TRADE REAL MONEY`.
+
+From then on, every trade the engine takes on a Kalshi market is also sent to Kalshi as a real order:
+
+- An immediate-or-cancel limit buy at the same limit the paper fill used (best ask + 3c, never above 95c), so nothing
+  rests on the book. Sized so price plus the worst-case taker fee fits `LIVE_MAX_ORDER_USD`.
+- Hard caps: `LIVE_MAX_ORDER_USD` per order, `LIVE_MAX_DAILY_USD` per 24 h, `LIVE_MAX_ORDERS_PER_HOUR`, and one real
+  position per market. An order whose outcome is unknown (network timeout) counts at full size and is never retried.
+- **It only buys.** It never sells or closes; positions are held to settlement unless you close them on kalshi.com.
+  Kalshi nets YES and NO in the same market, so a bot NO buy offsets a YES position you opened by hand there (and
+  vice versa). Trade real money by hand in other markets, or keep a separate Kalshi account for the bot.
+- Caps are counted from the local ledger. Restoring an older backup forgets real orders placed after it; reconcile on
+  kalshi.com before switching back to real. One engine per results folder: a second one refuses to start.
+- Kalshi only. Polymarket, shadow and test (`--inject`) trades always stay on paper. The paper book keeps recording
+  every trade either way, and real orders show in their own table on the dashboard (`live_orders` in the ledger).
+- Back to paper by itself on a restart, a Kalshi auth error, or three failed orders in a row. Back to paper by hand
+  with the dashboard button or `python3 -m fastlane.live paper`. Last resort: revoke the API key on kalshi.com.
+
+The switch only works from the dashboard on your own machine: it needs a per-process token that other websites cannot
+read, and the Vercel copy has no switch at all.
+
+## Dashboard on Vercel
+
+The engine runs on your machine; Vercel cannot hold the news pollers or the Kalshi WebSocket. What you can put on
+Vercel is a password-protected, read-only copy of your dashboard, on your own Vercel account:
+
+```bash
+npm i -g vercel && vercel login         # once
+python3 -m fastlane.deploy              # prints your URL and a generated password (stored in fastlane/results/vercel.json)
+python3 -m fastlane.run --vercel        # engine + resync every 30 min when the ledger changed
+```
+
+The deployment holds a snapshot of your ledger, the markets it mentions, and a salted hash of the password (never the
+password, never your `.env`). Pages are `noindex`. Set your own name or password with `--name` / `--password`. Vercel's
+free plan allows 100 deployments a day, so syncing is limited to every 20 minutes or slower.
+
+## Error reports
+
+Every install writes errors to `fastlane/results/errors.log`. When the build has the maintainer's Sentry project set
+(`MAINTAINER_DSN_*` in `fastlane/errors.py`), crash reports also go there so breakage gets fixed before you have to
+report it; the engine's first line says which applies. Each report holds the exception type, a scrubbed message, stack
+frames (file, line, function, with your home directory replaced by `~`), the fastlane version, Python version and OS.
+It never holds API keys, environment variables, local variables, headlines, request data, IP addresses or your
+hostname, and the same error is sent at most once per 10 minutes (30 an hour at most). The engine prints which mode is
+active on start. **Opt out** with `FASTLANE_TELEMETRY=0`, or send reports to your own Sentry with
+`FASTLANE_SENTRY_DSN`.
+
+## Rate limits and spending caps
+
+- Dashboard API: `API_RATE_LIMIT_PER_MIN` per client (default 120, HTTP 429 with `Retry-After` beyond). The paper/real
+  switch has its own bucket of 10 a minute. The Vercel copy limits password attempts the same way.
+- Jev: at most `JEV_MAX_CALLS_PER_HOUR` calls and `JEV_MAX_USD_PER_DAY` dollars (OpenRouter's reported cost), counted
+  from the ledger so a restart does not reset them. Also set a credit limit on the key itself at openrouter.ai.
+- Real orders: the `LIVE_MAX_*` caps above.
+
+## Backups
+
+The engine backs the ledger up every `BACKUP_EVERY_HOURS` and on clean shutdown: a consistent SQLite snapshot,
+gzipped, with a manifest of row counts, in `BACKUP_DIR` (keep `BACKUP_KEEP`). `python3 -m fastlane.backup --verify`
+is the restore drill: it restores the newest backup to a temp file, checks integrity, checks the counts match the
+manifest, and runs the dashboard query on it. Run it after setting things up, and after changing `BACKUP_DIR`.
+`--restore PATH --yes` replaces the ledger (stop the engine first; the old one is kept as `ledger.db.pre-restore-*`).
+Under Docker the backups land in the results volume; mount a second volume at `BACKUP_DIR` to keep them apart.
+
+If a release goes wrong, see [ROLLBACK.md](ROLLBACK.md).
 
 ## Shadow mode
 
@@ -178,13 +273,15 @@ Speed notes:
 - Jev (TypeSafe, via the OpenRouter Decisions API, early access) may change or disappear, and vendor latency claims
   are unverified.
 - The Kalshi tape needs an API key. Polymarket has no live tape here.
-- Paper fills assume the book you fetched is the book you would have hit.
+- Paper fills assume the book you fetched is the book you would have hit. Real orders can fill worse, or not at all.
+- Real trading only opens positions. There is no exit logic: positions are held to settlement or closed by you.
 - There is no resolution tracking: P&L is mark-to-bid.
 
 ## Outputs
 
-`fastlane/results/` (gitignored): `ledger.db` (SQLite), `universe.json` (market cache, refreshed every 15 min), and
-benchmark files.
+`fastlane/results/` (gitignored): `ledger.db` (SQLite), `universe.json` (market cache, refreshed every 15 min),
+`backups/`, `errors.log`, `trading_mode.json` and `engine_state.json` (the paper/real switch), `vercel.json` and
+`vercel/` (the deploy), and benchmark files.
 
 The decision log shows two numbers per judged headline: `price moved` (mid-price move in the leaned direction, before
 costs) and `after costs` (per contract, bought at the ask at decision, sold at the bid at the latest mark, minus taker

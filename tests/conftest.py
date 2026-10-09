@@ -11,7 +11,11 @@ from fastlane.ledger import Ledger
 from fastlane.universe import Universe
 
 _ENV_VARS = ["OPENROUTER_API_KEY", "JEV_MODEL", "SEC_USER_AGENT", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
-             "SHADOW_ENABLED", "SHADOW_SIGNAL_THRESHOLD", "SHADOW_DECISIVE_MIN", "MAX_SPREAD_CENTS", "COST_TO_ROOM_MAX"]
+             "SHADOW_ENABLED", "SHADOW_SIGNAL_THRESHOLD", "SHADOW_DECISIVE_MIN", "MAX_SPREAD_CENTS", "COST_TO_ROOM_MAX",
+             "LIVE_TRADING_ENABLED", "LIVE_MAX_ORDER_USD", "LIVE_MAX_DAILY_USD", "LIVE_MAX_ORDERS_PER_HOUR",
+             "JEV_MAX_CALLS_PER_HOUR", "JEV_MAX_USD_PER_DAY", "API_RATE_LIMIT_PER_MIN", "API_RATE_LIMIT_BURST",
+             "BACKUP_DIR", "BACKUP_KEEP", "BACKUP_EVERY_HOURS", "FASTLANE_SENTRY_DSN", "FASTLANE_TELEMETRY",
+             "FASTLANE_HOSTED", "FASTLANE_DASHBOARD_PASSWORD_HASH", "VERCEL"]
 
 OLD_SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -43,10 +47,17 @@ CREATE TABLE IF NOT EXISTS marks (
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    """Host env must never leak into tests."""
+def _clean_env(monkeypatch, tmp_path):
+    """Host env must never leak into tests, and tests never write into the real results directory."""
+    from fastlane import api, backup, errors, live
+    api.app.middleware_stack = None  # rebuilt on the next request: fresh rate-limit buckets per test
     for name in _ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FASTLANE_TELEMETRY", "0")
+    monkeypatch.setattr(live, "MODE_FILE", tmp_path / "trading_mode.json")
+    monkeypatch.setattr(live, "ENGINE_FILE", tmp_path / "engine_state.json")
+    monkeypatch.setattr(backup, "DB_PATH", tmp_path / "no-such-ledger.db")
+    monkeypatch.setattr(errors, "ERROR_LOG", tmp_path / "errors.log")
 
 
 def _pem(key) -> str:
