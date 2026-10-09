@@ -186,11 +186,13 @@ def test_shadow_keeps_room_rule_and_fallbacks():
 
 def test_settings_from_env(monkeypatch):
     assert decision.shadow_settings() == (True, .60, 0.0)
-    assert decision.cost_settings() == (.03, .25)
+    assert decision.cost_settings() == (.03, .25, .03)
     monkeypatch.setenv("SHADOW_ENABLED", "false"); monkeypatch.setenv("SHADOW_SIGNAL_THRESHOLD", "0.8")
     monkeypatch.setenv("SHADOW_DECISIVE_MIN", "0.1"); monkeypatch.setenv("MAX_SPREAD_CENTS", "5")
     monkeypatch.setenv("COST_TO_ROOM_MAX", "0.5")
-    assert decision.shadow_settings() == (False, .8, .1) and decision.cost_settings() == (.05, .5)
+    assert decision.shadow_settings() == (False, .8, .1) and decision.cost_settings() == (.05, .5, .03)
+    monkeypatch.setenv("MIN_ENTRY_PRICE", "0.05")
+    assert decision.cost_settings()[2] == .05
     monkeypatch.setenv("SHADOW_SIGNAL_THRESHOLD", "")  # empty value falls back to the default
     assert decision.shadow_settings()[1] == .60
 

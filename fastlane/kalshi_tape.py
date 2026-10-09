@@ -7,6 +7,8 @@ Ticks for markets the engine is tracking are also persisted to the ledger for th
 """
 import asyncio
 import json
+import os
+import re
 import time
 from collections import defaultdict, deque
 
@@ -29,9 +31,25 @@ MOVE_COOLDOWN_S = 600      # one event per Kalshi event (strike ladder) per 10 m
 MOVE_CATEGORIES = {"Politics", "Elections", "World", "Economics", "Companies", "Science and Technology", "AI",
                    "Health", "Social", "Entertainment", "Transportation", "Business"}
 
+# Price ladders that pass the category filter but track a continuously moving underlying (AAA gas, "price on <date>"
+# targets): a repricing there is price action, not news. Matched against the market title and the ticker (env MOVE_DENY_RE).
+MOVE_DENY_DEFAULT = (r"\bgas prices?\b"
+                     r"|\bprices?\s+(?:today|tomorrow|this week|on\s+[A-Za-z]{3,9}\.?\s+\d{1,2})\b"
+                     r"|^KXAAAGAS")
+
+
+def move_deny_re(env=None) -> re.Pattern:
+    """Compiled MOVE_DENY_RE (case-insensitive); MOVE_DENY_DEFAULT when unset or empty. re.error -> ValueError."""
+    raw = ((env if env is not None else os.environ).get("MOVE_DENY_RE") or "").strip()
+    try:
+        return re.compile(raw or MOVE_DENY_DEFAULT, re.I)
+    except re.error as exc:
+        raise ValueError(f"MOVE_DENY_RE is not a valid regex: {exc}") from exc
+
 
 class KalshiTape:
-    def __init__(self, ledger, universe_ids=None, market_info=None, on_move=None, sign_headers=None):
+    def __init__(self, ledger, universe_ids=None, market_info=None, on_move=None, sign_headers=None,
+                 deny_re: re.Pattern | None = None):
         self.ledger = ledger
         self.universe_ids = universe_ids  # callable returning a set; ticks outside it are dropped
         self.hist: dict[str, deque] = defaultdict(lambda: deque(maxlen=HISTORY_PER_MARKET))
@@ -44,6 +62,8 @@ class KalshiTape:
         self.on_move = on_move          # callable(ticker, (ts, bid, ask) before, (ts, bid, ask) now)
         self._cooldown: dict[str, float] = {}
         self.moves = 0
+        self.deny_re = deny_re
+        self.moves_denied = 0
 
     def _check_move(self, ticker: str, now: float, bid: float, ask: float):
         if not self.on_move or bid <= 0 or ask >= 1 or ask - bid > MOVE_MAX_SPREAD:
@@ -64,6 +84,9 @@ class KalshiTape:
         info = self.market_info(ticker) if self.market_info else None
         if (not info or info.get("volume_24h", 0) < MOVE_MIN_VOLUME_24H
                 or info.get("category") not in MOVE_CATEGORIES):
+            return
+        if self.deny_re and (self.deny_re.search(info.get("question") or "") or self.deny_re.search(ticker)):
+            self.moves_denied += 1
             return
         self._cooldown[event_key] = now
         self.moves += 1

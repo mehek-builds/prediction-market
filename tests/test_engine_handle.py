@@ -13,9 +13,11 @@ from fastlane.ledger import Ledger
 class FakeJev:
     def __init__(self, answers=None, exc=None, result=None):
         self.answers, self.exc, self.result, self.calls = answers, exc, result, 0
+        self.last_questions = None
 
     async def decide(self, state, questions):
         self.calls += 1
+        self.last_questions = questions
         if self.exc:
             raise self.exc
         if self.result is not None:
@@ -446,3 +448,128 @@ def test_concurrent_same_market_events_make_one_shadow_trade(eng, monkeypatch):
     assert _trades(eng) == [("AVNT-1", "yes", 1)]
     reasons = sorted(r[0] for r in eng.ledger.db.execute("SELECT shadow_reason FROM decisions"))
     assert reasons == ["already_in_market"] * 5 + ["signal_yes"]
+
+
+def test_status_mentions_fast_sources(eng):
+    eng.tape_enabled = True            # _make_engine runs with the tape off; the denied count only shows with it on
+    s = eng.status()
+    assert "x off" in s and "bsky idle DOWN 0 posts" in s and "0 denied" in s
+
+
+def test_status_x_segment_when_enabled(eng):
+    eng.xfeed.enabled = True
+    eng.feed_stats["x"].update(calls_today=3, spend_today_usd=0.165, budget_hit=True, in_window=False)
+    s = eng.status()
+    assert "x 3 calls $0.17 today BUDGET HIT (outside window)" in s or "x 3 calls $0.16 today BUDGET HIT (outside window)" in s
+
+
+def test_move_event_excludes_same_series_not_others(monkeypatch, tmp_path, tiny_universe):
+    extra = [{"venue": "kalshi", "id": "KXFEDDECISION-25OCT29-C25", "question": "Fed decision in October: Cut 25 bps", "category": "Economics", "yes_ask": .6, "yes_bid": .58, "volume_24h": 900},
+             {"venue": "kalshi", "id": "KXFEDDECISION-25DEC10-C25", "question": "Fed decision in December: Cut 25 bps", "category": "Economics", "yes_ask": .5, "yes_bid": .48, "volume_24h": 900},
+             {"venue": "kalshi", "id": "KXFEDCHAIR-26MAY-POW", "question": "Fed decision: next Fed chair confirmed", "category": "Politics", "yes_ask": .3, "yes_bid": .28, "volume_24h": 900}]
+    tiny_universe._set(tiny_universe.markets + extra)
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe)
+    e.jev = FakeJev(lambda qs: {k: {"probabilities": {"no_signal": 1.0}} for k in qs})
+    ev = {"id": "move-KXFEDDECISION-25OCT29-C25-1", "source": "kalshi_move", "summary": "", "url": "", "published_ts": time.time(),
+          "seen_ts": time.time(), "headline": 'Prediction market "Fed decision in October: Cut 25 bps" just repriced from 50% to 60% within 5 seconds',
+          "exclude_series": "KXFEDDECISION"}
+    _run(e, ev)
+    asked = " ".join(q["instructions"] for q in e.jev.last_questions.values())
+    assert "Cut 25 bps" not in asked and "next Fed chair confirmed" in asked
+
+
+def test_on_move_sets_exclude_series_not_event(eng):
+    eng._on_move("KXFEDDECISION-25OCT29-C25", {"question": "Fed decision in October: Cut 25 bps"},
+                 (time.time() - 5, .50, .52), (time.time(), .60, .62))
+    ev = eng.queue.get_nowait()
+    assert ev["exclude_series"] == "KXFEDDECISION" and "exclude_event" not in ev
+
+
+def test_polymarket_candidates_never_excluded_by_series(monkeypatch, tmp_path, tiny_universe):
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe)
+    e.jev = FakeJev(_answers_for(target_key_text="Bitcoin"))
+    ev = _event(headline="Bitcoin ladder moonshot", exclude_series="9001")
+    _run(e, ev)
+    assert any("moonshot" in q["instructions"] for q in e.jev.last_questions.values())
+
+
+def test_no_exit_liquidity_is_pass_real_and_shadow(monkeypatch, tmp_path, tiny_universe):
+    nobid = lambda mid: Book("kalshi", mid, [(.55, 1000)], [])             # no NO asks: no YES bid
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe, book=nobid)
+    rec = _run(e, _event())
+    assert (rec["action"], rec["reason"]) == ("PASS", "no_exit_liquidity") and _trades(e) == []
+    assert rec["shadow_reason"] == "real_signalled"
+    (tmp_path / "b").mkdir()
+    e2 = _make_engine(monkeypatch, tmp_path / "b", tiny_universe, book=nobid)
+    e2.jev = FakeJev(_answers_for(probs=LEAN))
+    rec2 = _run(e2, _event())
+    assert (rec2["shadow_action"], rec2["shadow_reason"]) == ("PASS", "no_exit_liquidity") and _trades(e2) == []
+
+
+def test_one_cent_no_with_no_bid_incident(monkeypatch, tmp_path, tiny_universe):
+    """The live incident: 20,000 NO contracts at 1c where the NO side had no bid. Must never fill."""
+    nobid_no = lambda mid: Book("kalshi", mid, [], [(.01, 20000)])
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe, book=nobid_no)
+    e.jev = FakeJev(_answers_for(probs={"decisive_no": .8, "toward_no": .15, "no_signal": .05}))
+    rec = _run(e, _event())
+    assert (rec["action"], rec["reason"]) == ("PASS", "no_exit_liquidity")
+    assert _trades(e) == []
+
+
+def test_longshot_is_pass(monkeypatch, tmp_path, tiny_universe):
+    cheap = lambda mid: Book("kalshi", mid, [(.02, 100000)], [(.97, 1000)])  # yes ask 2c, yes bid 3c
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe, book=cheap)
+    rec = _run(e, _event())
+    assert (rec["action"], rec["reason"]) == ("PASS", "longshot") and _trades(e) == []
+    monkeypatch.setenv("MIN_ENTRY_PRICE", "0.02")
+    (tmp_path / "b").mkdir()
+    e2 = _make_engine(monkeypatch, tmp_path / "b", tiny_universe, book=cheap)
+    assert _run(e2, _event())["reason"] != "longshot"
+
+
+def _two_market_engine(monkeypatch, tmp_path, tiny_universe):
+    a = {"venue": "kalshi", "id": "AVNT-2", "question": "Avient quarterly earnings beat estimates", "category": "Companies",
+         "yes_ask": .31, "yes_bid": .29, "volume_24h": 200}
+    tiny_universe._set(tiny_universe.markets + [a])
+
+    def book(mid):
+        return Book("kalshi", mid, [(.31, 1000)], [(.71, 1000)]) if mid == "AVNT-2" else Book("kalshi", mid, [(.55, 1000)], [(.47, 1000)])
+    e = _make_engine(monkeypatch, tmp_path, tiny_universe, book=book)
+    e.verbose = True
+
+    def answers(questions):
+        out = {}
+        for k, q in questions.items():
+            if "Avient" not in q["instructions"]:
+                out[k] = {"probabilities": {"no_signal": 1.0}}
+            elif "estimates" in q["instructions"]:
+                out[k] = {"probabilities": {"decisive_yes": .3, "toward_yes": .35, "no_signal": .35}}
+            else:
+                out[k] = {"probabilities": {"decisive_yes": .3, "toward_yes": .4, "no_signal": .3}}
+        return out
+    e.jev = FakeJev(answers)
+    return e
+
+
+def test_shadow_fill_line_names_the_shadow_market(monkeypatch, tmp_path, tiny_universe, capsys):
+    e = _two_market_engine(monkeypatch, tmp_path, tiny_universe)
+    rec = _run(e, _event())
+    assert rec["market_id"] == "AVNT-1" and rec["shadow_market_id"] == "AVNT-2"
+    out = capsys.readouterr().out
+    line = next(l for l in out.splitlines() if "shadow market ->" in l)
+    assert "Avient quarterly earnings beat estimates" in line and "kalshi" in line and "differs from the real decision" in line
+
+
+def test_shadow_fill_line_has_no_suffix_when_same_market(eng, capsys):
+    eng.verbose = True
+    eng.jev = FakeJev(_answers_for(probs=LEAN))
+    rec = _run(eng, _event())
+    assert rec["shadow_market_id"] == "AVNT-1"
+    line = next(l for l in capsys.readouterr().out.splitlines() if "shadow market ->" in l)
+    assert "Avient quarterly earnings beat" in line and "differs" not in line
+
+
+def test_finish_line_fits_long_source(eng, capsys):
+    eng.verbose = True
+    _run(eng, _event(source="bsky:washingtonpost.com"))
+    assert "[bsky:washingtonpost.]" in capsys.readouterr().out

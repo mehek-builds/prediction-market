@@ -48,3 +48,18 @@ def test_report_on_old_schema_ledger(old_ledger_path, monkeypatch, capsys):
     monkeypatch.setattr(report, "DB_PATH", old_ledger_path)
     report.main(None)   # must not raise on a pre-0.2.0 ledger
     assert "Shadow vs real" in capsys.readouterr().out
+
+
+def test_source_lag_section_with_fast_sources(tmp_ledger, tmp_path, monkeypatch, capsys):
+    import time
+    now = time.time(); L = tmp_ledger
+    L.event({"id": "x-1", "source": "x:DeItaone", "headline": "wire", "seen_ts": now - 100, "published_ts": now - 140})
+    L.event({"id": "bsky-ab", "source": "bsky:reuters.com", "headline": "bsky", "seen_ts": now - 90, "published_ts": now - 92})
+    L.event({"id": "f1", "source": "trumpstruth", "headline": "post", "seen_ts": now - 80, "published_ts": now - 380})
+    for eid, t in (("x-1", now - 100), ("bsky-ab", now - 90), ("f1", now - 80)):
+        L.decision(eid, action="PASS", reason="no_candidates", decided_ts=t, total_ms=5, shortlist_ms=1)
+    monkeypatch.setattr(report, "DB_PATH", tmp_path / "ledger.db")
+    report.main(None)
+    out = capsys.readouterr().out
+    assert "bsky:reuters.com" in out and "x:DeItaone" in out and "trumpstruth" in out
+    assert out.index("bsky:reuters.com") < out.index("x:DeItaone") < out.index("trumpstruth")   # sorted by p50 lag

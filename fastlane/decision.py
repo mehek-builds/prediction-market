@@ -9,7 +9,7 @@ picked. Naming the market inside each question removes that ambiguity (e.g. "Fed
 import os
 
 # MAX_ENTRY_PRICE (0.95) is the fill guard's cap, reused so "no room" means "would not fill"
-from fastlane.books import COST_TO_ROOM_MAX, MAX_ENTRY_PRICE, MAX_SPREAD
+from fastlane.books import COST_TO_ROOM_MAX, MAX_ENTRY_PRICE, MAX_SPREAD, MIN_ENTRY_PRICE
 
 # Fixed decision threshold: the trade rule lives here, not in the model.
 SIGNAL_THRESHOLD = 0.85   # probability mass on (decisive + toward) in one direction
@@ -36,9 +36,11 @@ def shadow_settings() -> tuple[bool, float, float]:
     return enabled, _env_float("SHADOW_SIGNAL_THRESHOLD", SHADOW_SIGNAL_THRESHOLD), _env_float("SHADOW_DECISIVE_MIN", SHADOW_DECISIVE_MIN)
 
 
-def cost_settings() -> tuple[float, float]:
-    """(max_spread, cost_to_room_max) from MAX_SPREAD_CENTS (cents) / COST_TO_ROOM_MAX (ratio)."""
-    return _env_float("MAX_SPREAD_CENTS", MAX_SPREAD * 100) / 100, _env_float("COST_TO_ROOM_MAX", COST_TO_ROOM_MAX)
+def cost_settings() -> tuple[float, float, float]:
+    """(max_spread, cost_to_room_max, min_entry) from MAX_SPREAD_CENTS (cents) / COST_TO_ROOM_MAX (ratio) /
+    MIN_ENTRY_PRICE (a price, not cents)."""
+    return (_env_float("MAX_SPREAD_CENTS", MAX_SPREAD * 100) / 100, _env_float("COST_TO_ROOM_MAX", COST_TO_ROOM_MAX),
+            _env_float("MIN_ENTRY_PRICE", MIN_ENTRY_PRICE))
 
 
 def strength_bucket(strength: float | None) -> str | None:

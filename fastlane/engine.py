@@ -8,14 +8,16 @@ import time
 
 import httpx
 
-from fastlane.books import cost_block, fetch_book, simulate_fill
+from fastlane.bluesky import BlueskyFeed
+from fastlane.books import COST_BLOCK_REASONS, cost_block, fetch_book, simulate_fill
 from fastlane.decision import build_request, cost_settings, decide, shadow_settings
 from fastlane.feeds import FeedHub
 from fastlane.jev_client import JevClient
 from fastlane.kalshi import KalshiClient
-from fastlane.kalshi_tape import KalshiTape
+from fastlane.kalshi_tape import KalshiTape, move_deny_re
 from fastlane.ledger import Ledger, mark_key
 from fastlane.universe import Universe
+from fastlane.x_feed import XFeed
 
 MARK_HORIZONS_S = [5, 30, 60, 300, 900, 3600]
 PREFETCH_BOOKS = 8          # fetch every candidate book while Jev is thinking (requests are cheap, waits are not)
@@ -52,7 +54,7 @@ class Engine:
         self.max_trade = self.bankroll * float(os.environ.get("PAPER_MAX_TRADE_PCT", 0.02))
         self.halt_loss = self.bankroll * float(os.environ.get("PAPER_DAILY_LOSS_HALT_PCT", 0.05))
         self.shadow_enabled, self.shadow_signal, self.shadow_decisive = shadow_settings()
-        self.max_spread, self.cost_to_room_max = cost_settings()
+        self.max_spread, self.cost_to_room_max, self.min_entry = cost_settings()
         self.workers = workers
         self.verbose = verbose
         self.queue: asyncio.Queue = asyncio.Queue()
@@ -63,13 +65,16 @@ class Engine:
         self.universe = Universe()
         self.ledger = Ledger()
         self.hub = FeedHub(self.queue, self.feed_stats)
+        self.xfeed = XFeed(self.queue, self.feed_stats, self.ledger)       # off without XAI_API_KEY
+        self.bsky = BlueskyFeed(self.queue, self.feed_stats, self.ledger)  # keyless; BSKY_ENABLED=false turns it off
         self.kalshi_ids: set[str] = set()
         self.by_id: dict[str, dict] = {}
         self.kalshi = KalshiClient()
         self.tape_enabled = self.kalshi.configured
         self.tape = KalshiTape(self.ledger, universe_ids=lambda: self.kalshi_ids,
                                market_info=self.by_id.get, on_move=self._on_move,
-                               sign_headers=self.kalshi.sign_headers if self.tape_enabled else None)
+                               sign_headers=self.kalshi.sign_headers if self.tape_enabled else None,
+                               deny_re=move_deny_re())
         self.processed = 0
         self.trades = 0
         self.shadow_trades = 0
@@ -101,6 +106,18 @@ class Engine:
             feed_tasks = self.hub.tasks()
             self._tasks += feed_tasks
             print(f"feeds: {len(feed_tasks)} pollers started (first poll of each = backlog, not traded)")
+            if self.xfeed.enabled:
+                s = self.xfeed.settings
+                self._tasks.append(asyncio.create_task(self.xfeed.run()))
+                print(f"x feed: {len(s.handles)} handles every {s.poll_seconds:.0f}s, window {s.start:%H:%M}-{s.end:%H:%M} "
+                      f"{s.tz.key} on {len(s.days)} weekdays, budget ${s.budget_usd:.2f}/UTC day")
+            else:
+                print("x feed off (no XAI_API_KEY)")
+            if self.bsky.enabled:
+                self._tasks.append(asyncio.create_task(self.bsky.run()))
+                print(f"bluesky: {len(self.bsky.settings.handles)} handles over Jetstream (polling fallback)")
+            else:
+                print("bluesky off (BSKY_ENABLED=false)")
 
     async def stop(self):
         pending = self._tasks + list(self._bg)
@@ -108,6 +125,8 @@ class Engine:
             t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         await self.hub.aclose()
+        await self.xfeed.aclose()
+        await self.bsky.aclose()
         await self.jev.aclose()
         await self.http.aclose()
 
@@ -153,7 +172,7 @@ class Engine:
                     f'{n_mid * 100:.0f}% within {now[0] - before[0]:.0f} seconds')
         ev = {"id": f"move-{ticker}-{int(now[0])}", "source": "kalshi_move", "headline": headline,
               "summary": "", "url": "", "published_ts": now[0], "seen_ts": time.time(),
-              "exclude_event": ticker.rsplit("-", 1)[0]}
+              "exclude_series": ticker.split("-", 1)[0]}
         self.queue.put_nowait(ev)
 
     def _tape_mid(self, ticker: str, ts: float | None):
@@ -175,8 +194,8 @@ class Engine:
         self.ledger.event(ev)
         t0 = time.perf_counter()
         cands = self.universe.shortlist(f"{ev['headline']} {ev.get('summary', '')}")
-        if ev.get("exclude_event"):  # a market move should not "predict" its own strike ladder
-            cands = [m for m in cands if not m["id"].startswith(ev["exclude_event"])]
+        if ev.get("exclude_series"):  # a market move must not "predict" its own series (any event of the same ladder family)
+            cands = [m for m in cands if not (m["venue"] == "kalshi" and m["id"].split("-", 1)[0] == ev["exclude_series"])]
         shortlist_ms = (time.perf_counter() - t0) * 1000
         rec = {"n_candidates": len(cands), "shortlist_ms": shortlist_ms}
 
@@ -246,12 +265,12 @@ class Engine:
         if action != "PASS" and book:
             side = "yes" if action == "BUY_YES" else "no"
             blocked = (freshness_block(ev, rec.get("mid_at_published"), book.mid(), side)
-                       or cost_block(book, side, self.max_spread, self.cost_to_room_max)
+                       or cost_block(book, side, self.max_spread, self.cost_to_room_max, self.min_entry)
                        or self._risk_block(chosen["id"], ev.get("synthetic", False)))
             if blocked:
                 rec["reason"] = blocked
-                if blocked == "too_expensive":
-                    action = rec["action"] = "PASS"   # cost filter: no buy intent recorded
+                if blocked in COST_BLOCK_REASONS:
+                    action = rec["action"] = "PASS"   # market-property filters: no buy intent recorded
             else:
                 fill = simulate_fill(book, side, self.max_trade)
                 if fill:
@@ -351,10 +370,10 @@ class Engine:
         else:
             mid_pub = self._tape_mid(s_id, ev.get("published_ts")) if s_chosen["venue"] == "kalshi" else None
         blocked = (freshness_block(ev, mid_pub, s_book.mid(), side)
-                   or cost_block(s_book, side, self.max_spread, self.cost_to_room_max)
+                   or cost_block(s_book, side, self.max_spread, self.cost_to_room_max, self.min_entry)
                    or ("already_in_market" if s_id in self.ledger.traded_markets(shadow=True) else None))
         if blocked:  # no bankroll or daily-halt check: the shadow book has no bankroll
-            return record("PASS" if blocked == "too_expensive" else sa, blocked)
+            return record("PASS" if blocked in COST_BLOCK_REASONS else sa, blocked)
         fill = simulate_fill(s_book, side, self.max_trade)
         if not fill:
             return record(sa, "no_fill_within_limit")
@@ -372,7 +391,9 @@ class Engine:
         record(sa, sr)
         if self.verbose:
             print(f"{'':16}** SHADOW FILL {sa} {fill['contracts']} @ {fill['avg_price']} cost ${fill['cost']} "
-                  f"fee ${fill['fee']} signal {ds['strength']:.2f} (looser rule, not a real paper trade)")
+                  f"fee ${fill['fee']} signal {ds['strength']:.2f} (looser rule, not a real paper trade)\n"
+                  f"{'':16}   shadow market -> {s_chosen['venue']}: {s_chosen['question'][:90]}"
+                  + ("" if chosen and s_id == chosen["id"] else "  (differs from the real decision's market)"))
 
     def _spawn(self, coro) -> asyncio.Task:
         """Run a background coroutine, tracked so stop() can cancel it."""
@@ -422,7 +443,7 @@ class Engine:
             lag = ev["seen_ts"] - ev["published_ts"] if ev.get("published_ts") else None
             lag_s = f"{lag:7.0f}s" if lag is not None else "      ?"
             tag = "SYN " if ev.get("synthetic") else ""
-            line = (f"{tag}[{ev['source'][:13]:13}] src-lag {lag_s} | match {rec['shortlist_ms']:5.1f}ms "
+            line = (f"{tag}[{ev['source'][:20]:20}] src-lag {lag_s} | match {rec['shortlist_ms']:5.1f}ms "
                     f"jev {_fmt_ms(rec.get('jev_ms'))} book-wait {_fmt_ms(rec.get('book_ms'))} "
                     f"total {_fmt_ms(rec.get('total_ms'))} | {rec['action']:7} {rec['reason']:20} | {ev['headline'][:70]}")
             print(line)
@@ -440,8 +461,15 @@ class Engine:
         polls = sum(s["polls"] for s in self.feed_stats.values())
         new = sum(s["new"] for s in self.feed_stats.values())
         if self.tape_enabled:
-            tape = f"tape {'up' if self.tape.connected else 'DOWN'} {self.tape.msgs:,} quotes, {self.tape.moves} moves"
+            tape = f"tape {'up' if self.tape.connected else 'DOWN'} {self.tape.msgs:,} quotes, {self.tape.moves} moves, {self.tape.moves_denied} denied"
         else:
             tape = "tape off (no Kalshi key)"
+        xs = self.feed_stats.get("x", {})
+        x = (f"x {xs.get('calls_today', 0)} calls ${xs.get('spend_today_usd', 0.0):.2f} today"
+             + (" BUDGET HIT" if xs.get("budget_hit") else "") + ("" if xs.get("in_window") else " (outside window)")
+             ) if self.xfeed.enabled else "x off"
+        bs = self.feed_stats.get("bsky", {})
+        b = (f"bsky {bs.get('mode')} {'up' if bs.get('connected') else 'DOWN'} {bs.get('new', 0)} posts"
+             if self.bsky.enabled else "bsky off")
         return (f"[status] polls {polls} | new items {new} | decided {self.processed} | paper trades {self.trades} | shadow {self.shadow_trades} "
-                f"| queue {self.queue.qsize()} | {tape}" + (f" | dead feeds: {', '.join(bad)}" if bad else ""))
+                f"| queue {self.queue.qsize()} | {tape} | {x} | {b}" + (f" | dead feeds: {', '.join(bad)}" if bad else ""))

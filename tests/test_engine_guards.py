@@ -56,3 +56,44 @@ def test_engine_tape_enabled_with_key(tmp_path, monkeypatch, rsa_pem):
     monkeypatch.setattr(engine, "Ledger", lambda: Ledger(tmp_path / "l.db"))
     e = engine.Engine()
     assert e.tape_enabled is True and e.tape.sign_headers is not None
+
+
+def test_engine_x_feed_off_without_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy")
+    monkeypatch.setattr(engine, "Ledger", lambda: Ledger(tmp_path / "l.db"))
+    e = engine.Engine()
+    assert e.xfeed.enabled is False and e.bsky.enabled is True and "x off" in e.status()
+
+
+def test_engine_rejects_invalid_handles(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy"); monkeypatch.setenv("XAI_API_KEY", "k")
+    monkeypatch.setenv("XAI_X_HANDLES", "a,b,c,d,e,f,g,h,i,j,k")
+    monkeypatch.setattr(engine, "Ledger", lambda: Ledger(tmp_path / "l.db"))
+    with pytest.raises(ValueError):
+        engine.Engine()
+
+
+def _run_cli(env_extra):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "OPENROUTER_API_KEY": "dummy", "XAI_API_KEY": "", **env_extra}
+    return subprocess.run([sys.executable, "-m", "fastlane.run", "--inject", "x", "--minutes", "0.01"], cwd=root,
+                          env=env, capture_output=True, text=True, timeout=60)
+
+
+def test_run_exits_on_invalid_move_deny_regex():
+    r = _run_cli({"MOVE_DENY_RE": "(unclosed"})
+    assert r.returncode != 0 and "MOVE_DENY_RE" in (r.stderr + r.stdout)
+
+
+def test_run_exits_on_invalid_xai_settings():
+    r = _run_cli({"XAI_API_KEY": "k", "XAI_X_HANDLES": "a,b,c,d,e,f,g,h,i,j,k"})
+    assert r.returncode != 0 and "XAI_X_HANDLES" in (r.stderr + r.stdout)
+
+
+def test_run_exits_on_invalid_bsky_handles():
+    r = _run_cli({"BSKY_HANDLES": "not a handle"})
+    assert r.returncode != 0 and "BSKY" in (r.stderr + r.stdout) and "Traceback" not in (r.stderr + r.stdout)

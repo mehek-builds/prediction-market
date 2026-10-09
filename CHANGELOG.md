@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0 - 2026-10-09
+
+### Added
+- X source: one Grok `x_search` call per poll over a fixed group of up to 10 handles (`XAI_API_KEY`, `XAI_X_HANDLES`,
+  `XAI_POLL_SECONDS`), only inside an active window (`XAI_WINDOW_DAYS/HOURS/TZ`, default US market hours) and under a
+  hard daily budget (`XAI_DAILY_BUDGET_USD`, default 25, persisted in the ledger). Posts are accepted only when the
+  URL handle is in the allowed list, the snowflake id decodes to a time inside the poll window, and the id is new;
+  the first poll of each window is backlog. Events are `x:<handle>` with the exact post time.
+- Bluesky source: newsroom accounts over the Jetstream firehose (keyless, `BSKY_ENABLED`, `BSKY_HANDLES`), own
+  top-level posts only, with a getAuthorFeed polling fallback. Events are `bsky:<handle>` with createdAt clamped to
+  receipt time.
+- Unofficial Trump archive RSS (`trumpstruth`) polled every 10 s; `@truthsocial` in the default X group.
+- Ledger tables `x_spend` (calls, USD, posts per UTC day) and `feed_status`; `/health` reports X calls and spend
+  today, budget and window flags, and Bluesky connection state; the status line shows the same.
+- Cost filter: `no_exit_liquidity` (held side has no bid) and `longshot` (entry below `MIN_ENTRY_PRICE`, default
+  0.03) block real and shadow trades, recorded as `PASS`.
+- Move detector: `MOVE_DENY_RE` (default: gas price and price-on-a-date ladders, `KXAAAGAS` tickers) never fires, and
+  a move event no longer matches markets of its own series family.
+
+### Changed
+- The shadow fill console line names the shadow market (venue and question), which can differ from the real
+  decision's market.
+- `decision.cost_settings()` returns `(max_spread, cost_to_room_max, min_entry)`.
+- `books.cost_block()` takes `min_entry` and returns `no_exit_liquidity` / `longshot` where it used to abstain.
+- Move events carry `exclude_series` instead of `exclude_event`.
+- `tests/test_no_orders.py` allows exactly two outbound POSTs: Jev and xAI. Real-rule thresholds unchanged.
+
 ## 0.2.0 - 2026-10-09
 
 ### Added

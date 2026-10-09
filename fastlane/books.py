@@ -12,6 +12,8 @@ MAX_ENTRY_PRICE = 0.95  # above this there is almost nothing left to win
 MAX_SPREAD = 0.03         # skip if getting out costs more than 3 cents of spread (env MAX_SPREAD_CENTS)
 COST_TO_ROOM_MAX = 0.25   # skip if round-trip cost (spread + both taker fees) eats over a quarter of the room
                           # to profit (env COST_TO_ROOM_MAX). "If the cost of trading eats the gains, it's not worth it."
+MIN_ENTRY_PRICE = 0.03    # below this a contract is a long shot: tiny room to lose, no realistic exit (env MIN_ENTRY_PRICE)
+COST_BLOCK_REASONS = frozenset({"too_expensive", "no_exit_liquidity", "longshot"})  # market-property blocks: recorded as PASS
 
 
 @dataclass
@@ -84,11 +86,25 @@ def round_trip_cost(book: Book, side: str) -> dict | None:
 
 
 def cost_block(book: Book, side: str, max_spread: float = MAX_SPREAD,
-               cost_to_room_max: float = COST_TO_ROOM_MAX) -> str | None:
-    """'too_expensive' | None. Deterministic: spread > max_spread, or cost > cost_to_room_max * room."""
+               cost_to_room_max: float = COST_TO_ROOM_MAX, min_entry: float = MIN_ENTRY_PRICE) -> str | None:
+    """'no_exit_liquidity' | 'longshot' | 'too_expensive' | None, in that order of precedence.
+
+    no_exit_liquidity: the held side has no bid, or a bid of 0 (nobody to sell to, ever).
+    longshot: entry below min_entry.
+    too_expensive: spread > max_spread, or round-trip cost > cost_to_room_max * room.
+    None also when the held side has no ask at all (the fill guard reports no_fill_within_limit).
+    """
+    entry = book.best(side)
+    if entry is None:
+        return None  # the fill guard handles empty ladders
+    exit_bid = book.bid(side)
+    if exit_bid is None or exit_bid <= 0:
+        return "no_exit_liquidity"
+    if entry < round(min_entry, 4):
+        return "longshot"
     c = round_trip_cost(book, side)
     if c is None:
-        return None  # the fill guard handles empty ladders
+        return None
     if c["spread"] > round(max_spread, 4) or c["cost"] > round(cost_to_room_max * c["room"], 6):
         return "too_expensive"
     return None

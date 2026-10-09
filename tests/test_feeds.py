@@ -59,3 +59,8 @@ def test_fetch_snapshot_dedupes_and_skips_failures(monkeypatch):
 
     out = asyncio.run(feeds.fetch_snapshot(Client()))
     assert [i["headline"] for i in out] == ["Same Headline"]
+
+
+def test_trump_archive_feed_wired():
+    url, every = FEEDS["trumpstruth"]
+    assert url == "https://www.trumpstruth.org/feed" and every == 10

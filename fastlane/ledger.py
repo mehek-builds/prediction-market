@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastlane.config import RESULTS_DIR
@@ -37,6 +38,12 @@ CREATE TABLE IF NOT EXISTS marks (
     event_id TEXT, horizon_s INTEGER, ts REAL, yes_ask REAL, yes_bid REAL, mid REAL,
     PRIMARY KEY (event_id, horizon_s)
 );
+CREATE TABLE IF NOT EXISTS x_spend (
+    day TEXT PRIMARY KEY, calls INTEGER DEFAULT 0, usd REAL DEFAULT 0, posts INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS feed_status (
+    name TEXT PRIMARY KEY, connected INTEGER DEFAULT 0, updated_ts REAL, info TEXT
+);
 """
 
 MIGRATIONS = [  # (table, column, type): added to ledgers created before the column existed
@@ -56,6 +63,11 @@ SHADOW_MARK_PREFIX = "shadow:"
 INDEX_MIGRATIONS = [  # idempotent; the dashboard API looks marks up by event_id several times per decision row
     "CREATE INDEX IF NOT EXISTS marks_event ON marks (event_id, horizon_s)",
 ]
+
+
+def utc_day(ts: float | None = None) -> str:
+    """'YYYY-MM-DD' of ts (default now) in UTC. The X budget is per UTC day."""
+    return datetime.fromtimestamp(time.time() if ts is None else ts, timezone.utc).strftime("%Y-%m-%d")
 
 
 def mark_key(event_id: str, shadow: bool) -> str:
@@ -116,3 +128,28 @@ class Ledger:
         start = time.time() - 86400
         return self.db.execute("SELECT COALESCE(SUM(cost + fee), 0) FROM trades WHERE opened_ts > ? AND synthetic = 0 AND shadow = 0",
                                (start,)).fetchone()[0]
+
+    def x_spend_add(self, day: str, usd: float, calls: int = 1, posts: int = 0) -> None:
+        self.db.execute("INSERT INTO x_spend VALUES (?,?,?,?) ON CONFLICT(day) DO UPDATE SET "
+                        "calls = calls + excluded.calls, usd = usd + excluded.usd, posts = posts + excluded.posts",
+                        (day, calls, usd, posts))
+
+    def x_spend(self, day: str) -> tuple[int, float]:
+        """(calls, usd) for the day, (0, 0.0) when absent."""
+        row = self.db.execute("SELECT calls, usd FROM x_spend WHERE day = ?", (day,)).fetchone()
+        return (int(row[0]), float(row[1])) if row else (0, 0.0)
+
+    def feed_status_set(self, name: str, connected: bool, info: dict | None = None) -> None:
+        self.db.execute("INSERT OR REPLACE INTO feed_status VALUES (?,?,?,?)",
+                        (name, int(bool(connected)), time.time(), json.dumps(info or {})))
+
+    def feed_status(self, name: str) -> dict | None:
+        """{"connected": bool, "updated_ts": float, "info": dict} or None."""
+        row = self.db.execute("SELECT connected, updated_ts, info FROM feed_status WHERE name = ?", (name,)).fetchone()
+        if not row:
+            return None
+        try:
+            info = json.loads(row[2] or "{}")
+        except ValueError:
+            info = {}
+        return {"connected": bool(row[0]), "updated_ts": row[1], "info": info}

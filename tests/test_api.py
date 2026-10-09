@@ -111,7 +111,11 @@ def test_decisions(seeded):
 
 def test_health_and_index(seeded):
     c, _, _ = seeded
-    assert c.get("/health").json() == {"ok": True, "ledger": True}
+    h = c.get("/health").json()
+    assert h["ok"] is True and h["ledger"] is True
+    assert h["x"] == {"enabled": False, "calls_today": 0, "spend_today_usd": 0.0, "budget_hit": False,
+                      "in_window": False, "updated_ts": None}
+    assert h["bluesky"] == {"connected": False, "mode": None, "updated_ts": None}
     r = c.get("/")
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
     assert "<title>Fast lane" in r.text
@@ -228,7 +232,31 @@ def test_old_schema_ledger_still_served(old_ledger_path, monkeypatch, tmp_path):
     assert d["trades"][0]["shadow"] is False and d["trades"][0]["bucket"] is None and d["summary"]["shadow_trades"] == 0
     dd = c.get("/decisions").json()["decisions"]
     assert dd[0]["shadow_action"] is None and dd[0]["shadow_traded"] is False and dd[0]["after_costs_cents"] is None
+    assert c.get("/health").json()["x"]["calls_today"] == 0   # tables absent: defaults, no 500
     assert old_ledger_path.read_bytes() == before   # opened read-only: the API never migrates or writes
     from fastlane.ledger import columns
     import sqlite3
     assert "shadow" not in columns(sqlite3.connect(old_ledger_path), "trades")
+
+
+def test_health_reports_fast_sources(seeded):
+    from fastlane.ledger import utc_day
+    c, L, _ = seeded
+    L.x_spend_add(utc_day(), 0.11, calls=2)
+    L.feed_status_set("x", True, {"enabled": True, "budget_hit": False, "in_window": True})
+    L.feed_status_set("bsky", True, {"mode": "ws"})
+    h = c.get("/health").json()
+    assert h["x"]["calls_today"] == 2 and h["x"]["spend_today_usd"] == pytest.approx(0.11)
+    assert h["x"]["enabled"] is True and h["x"]["in_window"] is True and h["x"]["budget_hit"] is False
+    assert h["bluesky"]["connected"] is True and h["bluesky"]["mode"] == "ws"
+    L.db.execute("UPDATE feed_status SET updated_ts = ?", (time.time() - 600,))
+    L.db.commit()
+    h = c.get("/health").json()
+    assert h["bluesky"]["connected"] is False and h["bluesky"]["mode"] == "ws"      # stale heartbeat: engine not running
+    assert h["x"]["enabled"] is True and h["x"]["in_window"] is False      # enabled = configured, not fresh
+
+
+def test_health_x_budget_hit_flag(seeded):
+    c, L, _ = seeded
+    L.feed_status_set("x", False, {"enabled": True, "budget_hit": True, "in_window": True})
+    assert c.get("/health").json()["x"]["budget_hit"] is True
