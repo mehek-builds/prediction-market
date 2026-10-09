@@ -201,7 +201,10 @@ Every install starts on paper, and every engine start resets to paper. To allow 
 2. Set `LIVE_TRADING_ENABLED=1` (and, if you want, tighter `LIVE_MAX_*` caps) in `.env`, then start the engine.
 3. In the dashboard, press **Switch to real trading**, read the terms, and type `TRADE REAL MONEY`.
 
-From then on, every trade the engine takes on a Kalshi market is also sent to Kalshi as a real order:
+From then on, every trade the engine takes on a Kalshi market is also sent to Kalshi as a real order, whatever
+triggered it: RSS and SEC headlines, X and Bluesky posts, the Trump archive feed, and Kalshi price-move events all
+count. Turn off any source you do not want trading real money (`XAI_API_KEY` empty, `BSKY_ENABLED=false`) before
+flipping the switch.
 
 - An immediate-or-cancel limit buy at the same limit the paper fill used (best ask + 3c, never above 95c), so nothing
   rests on the book. Sized so price plus the worst-case taker fee fits `LIVE_MAX_ORDER_USD`.

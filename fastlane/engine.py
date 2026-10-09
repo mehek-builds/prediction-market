@@ -141,11 +141,13 @@ class Engine:
         for t in pending:
             t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-        await self.hub.aclose()
-        await self.xfeed.aclose()
-        await self.bsky.aclose()
-        await self.jev.aclose()
-        await self.http.aclose()
+        # Each close is independent: one failing must not skip the others or the shutdown backup below.
+        for name, closer in (("hub", self.hub.aclose), ("xfeed", self.xfeed.aclose), ("bsky", self.bsky.aclose),
+                             ("jev", self.jev.aclose), ("http", self.http.aclose)):
+            try:
+                await closer()
+            except Exception as exc:
+                errors.capture(exc, f"engine.stop.{name}")
         try:
             if self._backs_up():
                 await asyncio.to_thread(backup.backup, self.ledger.path)
