@@ -1,0 +1,14 @@
+{
+  "captured_ts": 1791628910.0,
+  "meeting_date": "2026-10-28",
+  "period": "2026-10",
+  "statement_url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260916a.htm",
+  "statement_meeting_date": "2026-09-16",
+  "prior_statement_url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260729a.htm",
+  "prior_statement_date": "2026-07-29",
+  "prior_range_for_statement": [
+    3.5,
+    3.75
+  ],
+  "expected_bracket": "hike_25"
+}

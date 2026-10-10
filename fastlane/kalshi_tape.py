@@ -33,10 +33,16 @@ MOVE_CATEGORIES = {"Politics", "Elections", "World", "Economics", "Companies", "
                    "Health", "Social", "Entertainment", "Transportation", "Business"}
 
 # Price ladders that pass the category filter but track a continuously moving underlying (AAA gas, "price on <date>"
-# targets): a repricing there is price action, not news. Matched against the market title and the ticker (env MOVE_DENY_RE).
+# targets): a repricing there is price action, not news. Count and tally ladders (posts, tweets, mentions, "how many
+# times") are the same thing: the price follows a running count, not an event. Matched against the market title and the
+# ticker (env MOVE_DENY_RE).
 MOVE_DENY_DEFAULT = (r"\bgas prices?\b"
                      r"|\bprices?\s+(?:today|tomorrow|this week|on\s+[A-Za-z]{3,9}\.?\s+\d{1,2})\b"
-                     r"|^KXAAAGAS")
+                     r"|^KXAAAGAS"
+                     r"|\b(?:posts?|tweets?|mentions?)\s+(?:on\s+[A-Za-z]{3,9}\.?\s+\d{1,2}|today|tomorrow|this week|this month)\b"
+                     r"|\bhow many (?:times|posts|tweets|mentions)\b"
+                     r"|\btruth social posts?\b"
+                     r"|^KX(?:TRUTHSOCIAL|TRUMPPOSTS?|TWEETS?|MENTIONS?|SAYS?)W?-")
 
 
 def move_deny_re(env=None) -> re.Pattern:

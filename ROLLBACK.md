@@ -54,6 +54,8 @@ abandoned on rollback (they are paper). One caveat: v0.4.0 does not know the sta
 `shadow = 0`, so a v0.4.0 binary counts them with the real paper book; roll back with the starter book empty or
 ignore its rows (`trades.book = 'starter'`).
 
+v0.6.0 adds table `release_books` only; v0.5.0 reads the ledger unchanged.
+
 To ship the fix: fix forward on a branch, run the tests, tag a new patch version, and only then tell users to move.
 
 ## 3. Roll back the data

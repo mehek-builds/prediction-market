@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS release_markets (
 CREATE TABLE IF NOT EXISTS bls_requests (
     day TEXT PRIMARY KEY, n INTEGER DEFAULT 0
 );
+-- Order-book snapshots around a scheduled release (releases.py): every candidate market at decision and +5/+30/+60 s.
+CREATE TABLE IF NOT EXISTS release_books (
+    release_id TEXT, market_id TEXT, label TEXT, ts REAL, yes_bid REAL, yes_ask REAL, bid_qty REAL, ask_qty REAL,
+    PRIMARY KEY (release_id, market_id, label)
+);
 """ + SETTINGS_DDL + ";\n"
 
 # Filled rows count at no less than fill_count * limit cost: an IOC order never fills worse than its limit, so this
@@ -297,6 +302,16 @@ class Ledger:
         cols = list(m.keys())
         self.db.execute(f"INSERT OR REPLACE INTO release_markets ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                         tuple(m.values()))
+
+    def release_book_put(self, **r):
+        cols = list(r.keys())
+        self.db.execute(f"INSERT OR REPLACE INTO release_books ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                        tuple(r.values()))
+
+    def release_books(self, release_id: str) -> list[dict]:
+        cur = self.db.execute("SELECT * FROM release_books WHERE release_id = ? ORDER BY ts, market_id", (release_id,))
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row)) for row in cur.fetchall()]
 
     def x_spend_add(self, day: str, usd: float, calls: int = 1, posts: int = 0) -> None:
         self.db.execute("INSERT INTO x_spend VALUES (?,?,?,?) ON CONFLICT(day) DO UPDATE SET "

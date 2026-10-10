@@ -121,6 +121,23 @@ def x_settings(env=None) -> XSettings | None:
     return XSettings(key, tuple(handles), poll, budget, frozenset(days), start, end, tz)
 
 
+_DAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def days_label(days) -> str:
+    """Weekdays as text: all seven -> "every day"; runs collapse with a hyphen ("Mon-Fri"), runs join with commas."""
+    ds = sorted(set(days))
+    if len(ds) == 7:
+        return "every day"
+    runs: list[list[int]] = []
+    for d in ds:
+        if runs and d == runs[-1][-1] + 1:
+            runs[-1].append(d)
+        else:
+            runs.append([d])
+    return ", ".join(_DAY_LABELS[r[0]] if len(r) == 1 else f"{_DAY_LABELS[r[0]]}-{_DAY_LABELS[r[-1]]}" for r in runs)
+
+
 def in_window(s: XSettings, ts: float) -> bool:
     """start <= local time < end on an allowed weekday (end exclusive)."""
     local = datetime.fromtimestamp(ts, s.tz)

@@ -24,6 +24,7 @@ from test_live import _engine as _live_engine
 
 ET = ZoneInfo("America/New_York")
 FIX = Path(__file__).parent / "fixtures" / "release_rules"
+POLY = Path(__file__).parent / "fixtures" / "polymarket_fomc"
 SERIES = ["KXCPI", "KXCPIYOY", "KXPAYROLLS", "KXU3", "KXFED", "KXFEDDECISION"]
 
 
@@ -58,17 +59,44 @@ def bls_payload(rows):
         {"year": str(y), "period": p, "periodName": "x", "value": v, "footnotes": [{}]} for y, p, v in rows]}]}}
 
 
+PRIOR_LINK = "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260916a.htm"
+PRIOR_ITEM = (f"<item><title>Federal Reserve issues FOMC statement</title><link>{PRIOR_LINK}</link>"
+              "<pubDate>Wed, 16 Sep 2026 18:00:00 GMT</pubDate></item>").encode()
+PRIOR_PAGE = ("<html><body><p>The Committee decided to raise the target range for the federal funds rate by 1/4 "
+              "percentage point to 3-3/4 to 4 percent.</p></body></html>")      # the range FOMC's prior_range (3.75, 4.0) names
+
+
 class Net:
-    """One MockTransport for Kalshi markets, BLS and the Fed. `bls(request) -> payload` and `fed_feed`/`pages` are set per test."""
+    """One MockTransport for Kalshi markets, BLS, the Fed and Polymarket (gamma, CLOB from the captured fixtures).
+    `bls(request) -> payload` and `fed_feed`/`pages` are set per test. The feed always carries the 2026-09-16 statement
+    (the prior_range check reads it) unless `prior_in_feed` is False."""
     def __init__(self, clock=None, mutate=None, keep_close=False, only=None):
         self.clock, self.mutate, self.reqs = clock, mutate or {}, []
+        self.prior_in_feed = True
         self.keep_close, self.only = keep_close, only      # keep_close: serve the captured close times (they precede the release)
         self.bls = lambda req: bls_payload([])
         self.feed_xml = b"<rss version='2.0'><channel></channel></rss>"
-        self.pages = {}
+        self.pages = {PRIOR_LINK: PRIOR_PAGE}
+
+    def _poly(self, req):
+        """Gamma and CLOB answers from tests/fixtures/polymarket_fomc (None: not a Polymarket request)."""
+        host, path = req.url.host, req.url.path
+        if host == "gamma-api.polymarket.com" and self.only not in (None, "POLYFED"):
+            return httpx.Response(200, json={"events": []})                   # `only` restricts discovery to one series
+        if host == "gamma-api.polymarket.com":
+            f = (POLY / "search-2026-10.json" if path == "/public-search" else POLY / "event-2026-10.json" if path == "/events"
+                 else POLY / "markets" / (path.rsplit("/", 1)[-1] + ".json"))
+        elif host == "clob.polymarket.com" and path == "/book":
+            f = POLY / "books" / (req.url.params["token_id"] + ".json")
+        else:
+            return None
+        return httpx.Response(200, content=f.read_bytes()) if f.exists() else httpx.Response(404)
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         self.reqs.append((self.clock.t if self.clock else None, req))
+        poly = self._poly(req)
+        if poly is not None:
+            return poly
         if req.url.host == "api.bls.gov":
             return httpx.Response(200, json=self.bls(req))
         if req.url.path.endswith("/markets"):
@@ -81,7 +109,8 @@ class Net:
                 ms = self.mutate[s](ms)
             return httpx.Response(200, json={"markets": ms, "cursor": ""})
         if req.url.path.endswith("press_monetary.xml"):
-            return httpx.Response(200, content=self.feed_xml, headers={"etag": "x"})
+            body = self.feed_xml.replace(b"</channel>", PRIOR_ITEM + b"</channel>") if self.prior_in_feed else self.feed_xml
+            return httpx.Response(200, content=body, headers={"etag": "x"})
         if str(req.url) in self.pages:
             return httpx.Response(200, text=self.pages[str(req.url)])
         return httpx.Response(404)
@@ -90,12 +119,14 @@ class Net:
         return [r for _, r in self.reqs if r.url.host == host]
 
 
-def make(ledger, net, clock, env=None, cal=None, trades=None, books=None, quote_wait=0.05):
+def make(ledger, net, clock, env=None, cal=None, trades=None, books=None, quote_wait=0.05, styles=None):
     cfg = releases.settings({"BLS_API_KEY": "k", **(env or {})})
     http = httpx.AsyncClient(transport=httpx.MockTransport(net.handler))
 
-    async def trade(ev, market, side, bk, value, n_candidates=1):
+    async def trade(ev, market, side, bk, value, n_candidates=1, style=None):
         (trades if trades is not None else []).append((ev, market, side, bk, value))
+        if styles is not None:
+            styles.append((ev["source"], style))
 
     async def fetch(_http, market):
         return books(market["id"]) if books else Book("kalshi", market["id"], [(.50, 100)], [(.55, 100)])   # YES room .50 beats NO room .45
@@ -809,6 +840,7 @@ def fed_feed(items):
 
 
 LINK = "https://www.federalreserve.gov/newsevents/pressreleases/monetary20261028a.htm"
+OTHER = "https://www.federalreserve.gov/newsevents/pressreleases/monetary20261027a.htm"     # not the meeting day's statement URL
 STATEMENT_CUT = ("<html><body><p>The Committee decided to lower the target range for the federal funds rate by 1/4 "
                  "percentage point to 3-1/2 to 3-3/4 percent.</p></body></html>")
 
@@ -821,7 +853,10 @@ def test_fomc_cut_release_trades_fed_and_decision_series_from_prior_range(tmp_le
     status = asyncio.run(make(tmp_ledger, net, clock, trades=trades).run_release(FOMC))
     assert status == "done"
     by = {t[0]["source"]: t for t in trades}
-    assert set(by) == {"release:KXFED", "release:KXFEDDECISION"}
+    assert set(by) == {"release:KXFED", "release:KXFEDDECISION", "release:POLYFED"}
+    poly = [t for t in trades if t[0]["source"] == "release:POLYFED"]       # YES on cut_25, then one NO (POLY_FOMC_MAX_NO=1)
+    assert [(t[1]["id"], t[2]) for t in poly] == [("2589811", "yes"), ("2589810", "no")]
+    assert all(t[1]["venue"] == "polymarket" and t[4] == -25.0 for t in poly)
     assert by["release:KXFED"][4] == 3.75 and by["release:KXFEDDECISION"][4] == -25.0
     assert by["release:KXFEDDECISION"][1]["id"] == "KXFEDDECISION-26OCT-C25" and by["release:KXFEDDECISION"][2] == "yes"
     assert by["release:KXFED"][2] == "yes" and by["release:KXFED"][1]["id"].startswith("KXFED-26OCT-T")
@@ -832,18 +867,18 @@ def test_fomc_cut_release_trades_fed_and_decision_series_from_prior_range(tmp_le
 def test_fomc_statement_from_yesterday_is_ignored(tmp_ledger):
     clock = Clock(ts("2026-10-28", "13:50"))
     net, trades = Net(clock), []
-    net.feed_xml = fed_feed([("Federal Reserve issues FOMC statement", LINK, "Tue, 27 Oct 2026 18:00:00 GMT")])
-    net.pages[LINK] = STATEMENT_CUT
+    net.feed_xml = fed_feed([("Federal Reserve issues FOMC statement", OTHER, "Tue, 27 Oct 2026 18:00:00 GMT")])
+    net.pages[OTHER] = PRIOR_PAGE            # yesterday's statement is also what the arm-time prior_range check reads
     status = asyncio.run(make(tmp_ledger, net, clock, trades=trades).run_release(FOMC))
     assert status == "timed_out" and trades == []
-    assert not [r for r in net.of("www.federalreserve.gov") if "monetary2026" in r.url.path]    # the page was never fetched
+    assert len([r for r in net.of("www.federalreserve.gov") if str(r.url) == OTHER]) == 1   # only the arm-time check, never the poll
 
 
 def test_fomc_non_statement_titles_are_ignored(tmp_ledger):
     clock = Clock(ts("2026-10-28", "13:50"))
     net, trades = Net(clock), []
-    net.feed_xml = fed_feed([("Minutes of the Federal Open Market Committee", LINK, "Wed, 28 Oct 2026 18:00:00 GMT")])
-    net.pages[LINK] = STATEMENT_CUT
+    net.feed_xml = fed_feed([("Minutes of the Federal Open Market Committee", OTHER, "Wed, 28 Oct 2026 18:00:00 GMT")])
+    net.pages[OTHER] = STATEMENT_CUT
     assert asyncio.run(make(tmp_ledger, net, clock, trades=trades).run_release(FOMC)) == "timed_out"
 
 
@@ -1084,7 +1119,7 @@ def test_fomc_prior_range_that_disagrees_with_the_statements_from_range_is_no_tr
 def test_fomc_matching_from_range_still_trades(tmp_ledger):
     status, trades = _fomc_run(tmp_ledger, "lower the target range for the federal funds rate by 1/4 percentage point to 3-1/2 to 3-3/4 "
                                            "percent, from 3-3/4 to 4 percent.")
-    assert status == "done" and {t[0]["source"] for t in trades} == {"release:KXFED", "release:KXFEDDECISION"}
+    assert status == "done" and {t[0]["source"] for t in trades} == {"release:KXFED", "release:KXFEDDECISION", "release:POLYFED"}
 
 
 def test_fomc_failed_statement_page_is_retried_after_a_304_prone_feed(tmp_ledger):

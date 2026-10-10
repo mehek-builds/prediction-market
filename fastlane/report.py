@@ -255,6 +255,7 @@ def releases_section(db, marks, since):
     print("\nRelease trades:")
     if not rel:
         print("  none in range")
+        release_books_lines(db, since)
         return
     for eid, src, mkt, side, px, n, cost, fee, value in rel:
         m = marks.get(eid, {})
@@ -266,6 +267,28 @@ def releases_section(db, marks, since):
                 if exit_px is not None:
                     cells.append(f"+{h}s ${n * exit_px - cost - fee:+.2f}")
         print(f"  {src:22} value {value if value is not None else '?'}  {side.upper()} {n:g} @ {px} {mkt}  " + "  ".join(cells))
+    release_books_lines(db, since)
+
+
+def release_books_lines(db, since):
+    """Order-book snapshots around each release in range: one line per market (yes bid/ask at decision, +5s, +30s, +60s)."""
+    if "label" not in columns(db, "release_books"):
+        return
+    ids = [r[0] for r in db.execute("SELECT release_id FROM release_books GROUP BY release_id HAVING MIN(ts) > ? "
+                                    "ORDER BY MIN(ts)", (since,)).fetchall()]
+    order = ["decision", "+5s", "+30s", "+60s"]
+    for rid in ids:
+        print(f"  books around {rid} (yes bid/ask):")
+        rows = db.execute("SELECT market_id, label, yes_bid, yes_ask FROM release_books WHERE release_id = ? "
+                          "ORDER BY ts, market_id", (rid,)).fetchall()
+        by: dict[str, dict] = {}
+        for mkt, label, b, a in rows:
+            by.setdefault(mkt, {})[label] = (b, a)
+
+        def cell(x):
+            return "-" if x is None else f"{x:.2f}"
+        for mkt, labels in by.items():
+            print(f"    {mkt:12} " + "  ".join(f"{lb} {cell(labels[lb][0])}/{cell(labels[lb][1])}" for lb in order if lb in labels))
 
 
 def timeline(db, rows):

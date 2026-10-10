@@ -41,6 +41,7 @@ scheduled data: CPI / jobs report (BLS) and FOMC statements (federalreserve.gov)
 | `fastlane/engine.py` | Hot path, live-quote wait, one entry path for every book, risk checks, keep-warm pings, price marks. |
 | `fastlane/orders.py` | Resting paper orders (`ENTRY_STYLE=post`): placement, fill detection from book snapshots, expiry. Paper only, GET only. |
 | `fastlane/releases.py` | Scheduled data releases: calendar, BLS v2 polling and budget, FOMC statement parsing, Kalshi strike parsing, release trades, `--check`. |
+| `fastlane/poly_fomc.py` | Polymarket FOMC brackets: gamma discovery, question and description templates, bracket mapping, pre-order re-check, rehearsal fixture transport. GET only, paper only. |
 | `fastlane/release_calendar.json` | The owner-maintained release schedule (dates, times, prior FOMC range). An empty calendar never arms. |
 | `fastlane/replay.py` | `python3 -m fastlane.replay`: re-reads stored real-rule signals against the live-quote selection rule. Read only. |
 | `fastlane/ledger.py` | SQLite tables: events, decisions (per-stage timings), trades, marks, resting paper orders and fills, releases. |
@@ -95,6 +96,7 @@ Environment variables (see `.env.example`):
 | `STARTER_ENABLED` | optional | The starter book, default true. See [Starter book](#starter-book). |
 | `STARTER_SIGNAL_THRESHOLD` / `STARTER_DECISIVE_MIN` / `STARTER_SIZE_USD` | optional | Starter rule: strength threshold 0.90, decisive minimum 0.0, dollars per trade 20. |
 | `RELEASES_ENABLED` | optional | Scheduled data releases, default true (nothing arms without a calendar entry). See [Scheduled data releases](#scheduled-data-releases). |
+| `POLY_FOMC_ENABLED` / `POLY_FOMC_MAX_NO` | optional | FOMC on Polymarket, default true; dead brackets bought NO after the YES, default 1 (0 = none). Paper only. |
 | `BLS_API_KEY` | optional | Free BLS v2 registration key. Without it the CPI and jobs releases are disabled; FOMC releases do not need it. |
 | `RELEASE_POLL_START_S` / `RELEASE_POLL_EVERY_S` / `RELEASE_POLL_MAX_S` | optional | Start polling this many seconds before the release (2), poll every (1.5, min 1), give up after (90). |
 | `RELEASE_BLS_DAILY_BUDGET` | optional | BLS requests allowed per UTC day, counted in the ledger. Default 400. |
@@ -108,7 +110,7 @@ Environment variables (see `.env.example`):
 | `BSKY_ENABLED` | optional | Bluesky Jetstream consumer, keyless, default true. |
 | `BSKY_HANDLES` | optional | Comma separated Bluesky handles, default the ten newsroom accounts in `.env.example`. |
 | `MIN_ENTRY_PRICE` | optional | Cost filter: skip entries below this price (long shots), default 0.03. |
-| `MOVE_DENY_RE` | optional | Regex (case-insensitive) matched against a Kalshi market's title and ticker; matching markets never fire the move detector. Default excludes gas price and other price-on-a-date ladders. |
+| `MOVE_DENY_RE` | optional | Regex (case-insensitive) matched against a Kalshi market's title and ticker; matching markets never fire the move detector. Default excludes gas price and other price-on-a-date ladders, and count ladders (posts, tweets, mentions, "how many times"). |
 | `FASTLANE_ALLOWED_HOSTS` | optional | Extra Host header values the dashboard API accepts (comma separated). `localhost` and `127.0.0.1` are always allowed; other Hosts get HTTP 400 (DNS rebinding guard). Never expose the API port beyond this machine (`--host 0.0.0.0` without the `127.0.0.1:` Docker mapping, port forwarding, tunnels) while `LIVE_TRADING_ENABLED=1`: the Host check only protects browsers and does not stop other machines, and anyone who can reach the port can arm real trading within the `LIVE_MAX_*` caps. |
 | `LIVE_TRADING_ENABLED` | optional | `1` allows the dashboard's real-money switch. Off by default. See [Real trading](#real-trading-opt-in). |
 | `LIVE_MAX_ORDER_USD` | optional | Real trading: most one order may cost, fees included. Default 5. |
@@ -137,12 +139,13 @@ What is disabled when the optional ones are empty:
 ## Commands
 
 ```bash
-python3 -m fastlane.run                          # live until Ctrl-C
+python3 -m fastlane.run                          # live until Ctrl-C or SIGTERM (--minutes is optional)
 python3 -m fastlane.run --minutes 30 --workers 8 # live for 30 minutes, 8 decision workers
 python3 -m fastlane.run --inject "headline"      # synthetic headline (repeatable), live feeds off
 python3 -m fastlane.report                       # timeline + P&L from the ledger
 python3 -m fastlane.report --since-minutes 60
 python3 -m fastlane.replay --since-hours 24      # stored real-rule signals against live-quote selection (read only; --ledger PATH for a backup copy)
+python3 -m fastlane.releases --rehearse fomc    # replay a whole FOMC release on a fake clock from captured fixtures (offline, temp ledger)
 python3 -m fastlane.releases --check             # scheduled releases: calendar, market parse table, BLS key and budget (GET only, never trades)
 python3 -m fastlane.bench_jev --n 200 --repeats 3 --concurrency 4   # Jev latency/stability benchmark
 python3 -m fastlane.bench_jev --dry-run          # sources only, no Jev calls, no key needed
@@ -193,7 +196,9 @@ Docker network can then reach the API and arm). Never set uvicorn's `FORWARDED_A
   Vercel copy has no switches (the `H` cap is hidden); it shows the real-orders table from the snapshot.
 - WORKING ORDERS (under BOOKS, hidden when there is nothing to show): resting paper orders with book, market, side,
   limit, filled/requested, age and an expiry countdown, plus a dim line per order closed in the last 24 hours. Read only.
-- BLOTTER: every trade, sortable by column header, as a table or as cards. The ENTRY cell's tooltip says `take` or
+- BLOTTER: every trade, sortable by column header, as a table or as cards. NOW shows `no bid` when the held side has no
+  bid (the book still has asks); the position counts at 0 in every total. A closed or settled market with an empty book
+  shows as unknown, not 0. The ENTRY cell's tooltip says `take` or
   `post fill at limit 54c (take would have been 56c)`; cards of resting-order fills carry a `POST` chip.
 - P&L 24H: mark-to-bid curve per book.
 - LATENCY: p50, p90 and last for match, Jev, QUOTES (the live-quote wait after Jev), book and total.
@@ -259,8 +264,11 @@ unchanged. Room in the cost filter comes from the live book (1 minus best ask), 
 candidates.
 The same filter blocks `no_exit_liquidity` (the held side has no bid, so the position could never be sold) and
 `longshot` (entry below `MIN_ENTRY_PRICE`, 3c). All three are recorded as `PASS`. Markets whose title or ticker match
-`MOVE_DENY_RE` (gas price and other price-on-a-date ladders) never fire the move detector, and a move event never
-matches markets of its own series family.
+`MOVE_DENY_RE` (gas price and other price-on-a-date ladders, and count or tally ladders: posts, tweets, mentions, "how many
+times") never fire the move detector and are dropped as candidates of move events (news events keep them), and a move
+event never matches markets of its own series family. Example: on Oct 9 a Truth Social posts bracket repriced from 63% to
+88%, the move event fired and the week ladder of the same count became a losing trade; the trigger and that candidate are
+now both denied.
 The filter runs after selection, so when the chosen market is too expensive a cheaper second qualifier is not picked
 (the market is still tracked).
 
@@ -341,8 +349,8 @@ settles, in the LIVE paper book, without a Jev call. It is deterministic and use
 `KXCPIYOY`, `KXPAYROLLS` and `KXU3` at 08:29 ET, `KXFED` at 13:55 ET and `KXFEDDECISION` at 13:59 ET, while the numbers
 come out at 08:30 and 14:00 ET. The scheduler therefore drops every market whose `close_time` is at or before the release,
 re-checks `close_time` right before each trade, and refuses to arm (`markets_close_before_release`) when nothing is left.
-With the observed close times this feature does not trade any of the six series. It stays in the code for series that
-stay open past the release; a Polymarket target is planned.
+With the observed close times this feature does not trade any of the six Kalshi series. They stay in the code for series
+that stay open past the release; the Polymarket brackets (below) do.
 
 | Kalshi series | Statistic | Source | Computation | Settles at |
 |---|---|---|---|---|
@@ -352,6 +360,7 @@ stay open past the release; a Polymarket target is planned.
 | `KXU3` | Unemployment rate, seasonally adjusted | BLS `LNS14000000` | as published | 1 decimal |
 | `KXFED` | Upper bound of the target range after the meeting | FOMC statement | parsed range | 0.25 steps |
 | `KXFEDDECISION` | Change vs the prior range | FOMC statement plus `prior_range` | `hi - prior_hi` in bps | 25 bps steps |
+| `POLYFED` | Polymarket "Fed Decision in <Month>?" bracket | FOMC statement plus `prior_range` | `hi - prior_hi` in bps, mapped to a bracket | five brackets |
 
 Every numeric series is a ladder of `greater` markets ("more than X", "above X", "greater than X": strictly greater, so a
 value equal to the strike resolves NO). The strike comes from the market's own fields (`strike_type`, `floor_strike`),
@@ -392,8 +401,11 @@ published already rounded, so no boundary margin applies. Payrolls keep `RELEASE
 strike, per market. A value that sits exactly on the bound of a market type whose inclusivity no captured text proves
 is skipped (`strike_boundary`).
 
-FOMC: the feed `press_monetary.xml` is polled with conditional GETs from `T - 10 s` for up to 120 s; an item counts when
-its date is the meeting day and its title says "FOMC statement". The statement is parsed for "the target range for the
+FOMC: from `T - 5 s` the Fed is polled twice per round: the statement page for the meeting day
+(`.../pressreleases/monetary{YYYYMMDD}a.htm`, 404 until it is posted) and the feed `press_monetary.xml` (conditional GET).
+A round is every 0.5 s for the first 60 s, then every 2 s until `T + 300 s`, worst case 2 x (120 + 120) = 480 GETs,
+hard-capped at 500 (`request_cap`, status `timed_out`). The first source that yields a statement wins. A feed item counts when
+its date is the meeting day, its link is on `www.federalreserve.gov` and its title says "FOMC statement". The statement is parsed for "the target range for the
 federal funds rate at X to Y percent" (or "by 1/4 percentage point to X to Y percent"), with fractions like `3-3/4`.
 Exactly one match, 0.25 wide, inside 0 to 10, or it is `parse_doubt` and nothing is traded. With a `prior_range`, a
 change outside -50, -25, 0, +25, +50 bp, or a `prior_range` that disagrees with the statement's own "from X to Y percent"
@@ -405,8 +417,78 @@ fetched more than 10 minutes after `T`, `priced_in` if the market already moved 
 liquidity, risk checks), the LIVE book's entry style, and the same route to a real order as any other LIVE trade: all
 three real-money locks, the same caps, the NO-side rule. Shadow and starter never evaluate release events.
 
+### FOMC on Polymarket
+
+Why: Kalshi closes its Fed ladders before 14:00 ET, but Polymarket's "Fed Decision in <Month>?" brackets stay open until
+23:59 ET on the decision day, so there is something to buy after the statement. Series `POLYFED`, paper only.
+
+- Discovery: a gamma search ("Fed decision in October 2026") for an event titled "Fed Decision in <Month>?", then the event
+  by slug. A market is accepted only when its question matches one of the five captured templates verbatim ("Will the Fed
+  decrease interest rates by 50+ bps after the October 2026 meeting?", "... by 25 bps ...", "Will there be no change in Fed
+  interest rates ...", "... increase ... by 25 bps ...", "... by 50+ bps ...") for the calendar's month and year, its
+  description names `federalreserve.gov/monetarypolicy/fomccalendars.htm` and the "upper bound", its outcomes are exactly
+  Yes/No, it has two CLOB token ids, `acceptingOrders` is true, it is not closed and it is active. Its description must
+  also say "<Month> <Year> meeting" for the same month (`description_other_meeting` otherwise), and the calendar entry's
+  `date` must fall in its `period` month (`period_date_mismatch`: POLYFED is skipped for that entry and nothing is
+  discovered). Two matching events with accepted markets, or two markets with the same bracket in one event, mean
+  `ambiguous_event` and nothing is traded. Rejected markets are stored in `release_markets`
+  with the reason.
+- The bracket is the change of the upper bound in bps (cut 50+, cut 25, hold, hike 25, hike 50+), computed from the
+  statement and the calendar's `prior_range`. YES on the resolving bracket, NO on at most `POLY_FOMC_MAX_NO` dead
+  brackets (default 1, the one with the lowest NO ask; 0 = YES only).
+- Before each order the market's `acceptingOrders`/`closed`/`active` flags are read again and a fresh CLOB book must
+  show an ask and a bid on the wanted side. Entry is always `take` (a decisive event, no tape to wake a resting order),
+  in the LIVE paper book, with the same sizing and guards (cost filter, no exit liquidity, already in market, bankroll).
+- Paper only by construction: there is no Polymarket order client, `LiveTrader.gate` answers `paper_only_market` for
+  every venue but Kalshi, and `tests/test_poly_fomc.py` asserts that an armed engine sends zero requests on a Polymarket
+  release trade. `poly_fomc.py` is GET only.
+- Measurement: the release row records `statement_seen_ts` and its source (`url` or `feed`), `decided_ts`, `first_fill_ts`,
+  polls and GETs; table `release_books` holds each candidate market's book at the decision and at +5, +30 and +60 s
+  (`fastlane.report` prints them), so you can see how fast the market moves after the number.
+- `prior_range` check: at arm time (`T - 120 s`) the calendar's `prior_range` must equal the new range in the newest
+  earlier "FOMC statement" in the Fed feed. A disagreement refuses to arm (`prior_range_mismatch`), and so does an
+  unreachable feed or an unparseable page (`prior_range_unverified`): the whole FOMC path depends on that feed anyway.
+- Shutdown: the first SIGINT or SIGTERM stops the engine and restores the default handlers, so a second Ctrl-C during a
+  slow shutdown forces exit. A signal sent while the engine is still starting is honoured once start returns.
+- A release that crashed mid-run is `already_started` and is skipped on restart. Manual reset, only BEFORE the release time:
+  `sqlite3 fastlane/results/ledger.db "DELETE FROM releases WHERE id='fomc-2026-10'"` (use the release id `<kind>-<period>`).
+  Never delete it after T: the engine could buy a second market.
+- Rehearsal: `python3 -m fastlane.releases --rehearse fomc` runs a whole release offline on a fake clock against
+  `tests/fixtures/polymarket_fomc/` (captured from the live sites), in a temp ledger. It prints the arm result and the five
+  brackets, the prior-range check, the timing line, the trades, the `release_books` rows and the paper-only footer, and
+  exits 1 if the bracket bought on YES is not the one the fixture says the statement resolves.
+
+#### What happens on Oct 28
+
+The calendar entry is `fomc 2026-10-28 14:00 ET, period 2026-10, prior_range [3.75, 4.0]`.
+
+1. About 13:58 ET (T - 120 s) the scheduler arms. The Kalshi Fed series (`KXFED`, `KXFEDDECISION`) close before 14:00, so
+   their markets are dropped as closed. For POLYFED it checks that `date` is in `period`, finds the October event, accepts
+   only markets that pass every template check, and verifies the calendar's `prior_range` against the newest earlier "FOMC
+   statement" in the Fed feed (the Sep 16 statement, 3-3/4 to 4 percent). Any mismatch or doubt refuses to arm and nothing
+   is traded.
+2. From T - 5 s it polls the Fed: the statement URL and the press feed, every 0.5 s for the first minute, then every 2 s,
+   until T + 300 s, at most 500 GETs. The first source that yields a statement wins.
+3. The statement gives the new range; the change of the upper bound in bps picks the resolving bracket. It buys YES on that
+   bracket and at most one NO (`POLY_FOMC_MAX_NO`, the cheapest dead bracket), `take` entry, after re-checking that each
+   market still accepts orders and shows a fresh two-sided book. A non-25 bp move or anything unparseable trades nothing.
+   Paper only: no order can reach Polymarket.
+4. Afterwards the engine log shows the arm line, the poll timing and one line per bracket skipped or bought. The ledger
+   holds the `releases` row (status `done`, note `<n> traded, <n> skipped`, `statement_seen_ts`, polls, GETs),
+   `release_markets` (accepted and rejected brackets with reasons), `release_books` (all five books at the decision and
+   at +5, +30 and +60 s), the trade rows (LIVE paper book) and the decision rows. `python3 -m fastlane.report` prints them.
+5. The Dec 9, 2026 and later FOMC entries have no `prior_range`, so POLYFED (and `KXFEDDECISION`) is skipped for them
+   until the owner adds it after each meeting. After the Oct 28 meeting, edit the Dec 9 entry in
+   `fastlane/release_calendar.json` (no restart needed) by adding the new range, for example if the Oct 28 statement
+   says 3-1/2 to 3-3/4 percent: `{"kind": "fomc", "date": "2026-12-09", "time_et": "14:00", "period": "2026-12",
+   "prior_range": [3.5, 3.75]}`.
+
+Before Oct 28, run `python3 -m fastlane.releases --check --date 2026-10-28` once with network access to confirm the Fed feed
+still carries the Sep 16 statement and the five October brackets accept orders.
+
 `python3 -m fastlane.releases --check [--date YYYY-MM-DD]` prints the calendar entries for the date, the Kalshi markets
-found per series and whether their rules text matched, whether a BLS key is set, today's BLS request count, and (key
+found per series and whether their rules text matched (for FOMC dates also the POLYFED discovery table and the prior-range
+check), whether a BLS key is set, today's BLS request count, and (key
 set) one baseline fetch per series. It never trades and sends GET requests only.
 
 ## Real trading (opt-in)
@@ -606,7 +688,13 @@ Speed notes:
 - Post fills are simulated from displayed book size at snapshot times; a real resting order can fill less or later (or
   be queued behind others), and a trade that prints through our price between two snapshots is not seen.
 - Kalshi closes the CPI, jobs and Fed ladders 1 to 5 minutes before the release (see Scheduled data releases), so with
-  the observed close times scheduled releases do not trade. A Polymarket target is planned.
+  the observed close times only the Polymarket FOMC brackets trade on a release.
+- Polymarket's cumulative "rate cut by <meeting>" market is not traded: its question carries a cutoff window and a start
+  date that live only in the description. Follow-up.
+- A non-25 bp move (12.5 or 75 bp) is `parse_doubt` and nothing is traded, so Polymarket's "rounded up to the nearest 25"
+  clause is never exercised.
+- A position whose held side has asks but no bid is valued at 0, which can understate a thin book. A closed or settled
+  market (empty book) shows as unknown, not 0, and is left out of the totals.
 - Release trades race the market; the priced-in guard will block most of them when the market reprices faster than BLS
   answers.
 - Real trading only opens positions. There is no exit logic: positions are held to settlement or closed by you.

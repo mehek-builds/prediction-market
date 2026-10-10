@@ -1,8 +1,8 @@
-"""Scheduled data releases: read the number from the official source in the first seconds, buy the Kalshi strikes it settles.
+"""Scheduled data releases: read the number from the official source in the first seconds, buy the Kalshi strikes (and Polymarket Fed brackets) it settles.
 
 No LLM, no news feed: for a few scheduled releases (CPI, jobs report, FOMC statement) the settlement value is a number
 published by a known source at a known second, and the Kalshi ladders on that number are plain threshold markets.
-Everything here is GET only (BLS v2 API, the Federal Reserve statement feed, Kalshi public market data). Trades go
+Everything here is GET only (BLS v2 API, the Federal Reserve statement feed, Kalshi public market data, Polymarket gamma and CLOB). Trades go
 through Engine.trade_release into the LIVE paper book and from there through the same real-money locks as any other
 trade; this module cannot send an order.
 
@@ -18,6 +18,7 @@ Safety rules, in short:
 """
 import argparse
 import asyncio
+import heapq
 import json
 import math
 import os
@@ -28,14 +29,15 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import feedparser
 import httpx
 
-from fastlane import errors
-from fastlane.books import MAX_ENTRY_PRICE, Book
-from fastlane.config import PKG, kalshi_api_url
+from fastlane import errors, poly_fomc
+from fastlane.books import MAX_ENTRY_PRICE, Book, fetch_book
+from fastlane.config import PKG, ROOT, kalshi_api_url
 from fastlane.feeds import _clean
 from fastlane.ledger import utc_day
 
@@ -50,9 +52,15 @@ MAX_MARKET_PAGES = 5
 BASELINE_LEAD_S = 60        # baseline fetch this long before the release
 MARKETS_LEAD_S = 120        # Kalshi markets and rules texts this long before
 BOOK_PREFETCH_LEAD_S = 5    # warm the order books this long before
-FOMC_LEAD_S = 10
-FOMC_POLL_S = 2.0
-FOMC_MAX_S = 120.0
+FOMC_LEAD_S = 5             # start polling the Fed this long before the release
+FOMC_FAST_POLL_S = 0.5      # one round (statement URL + feed) every 0.5 s for the first minute
+FOMC_FAST_WINDOW_S = 60.0
+FOMC_POLL_S = 2.0           # then every 2 s
+FOMC_MAX_S = 300.0
+FOMC_MAX_REQUESTS = 500     # hard cap on GETs to the Fed per release: 2 x (120 + 120) = 480 at the cadence above
+FED_STATEMENT_URL = "https://www.federalreserve.gov/newsevents/pressreleases/monetary{ymd}a.htm"
+FED_HOST = "www.federalreserve.gov"
+RELEASE_BOOK_HORIZONS_S = (5, 30, 60)
 MAX_BEHIND_S = 300          # an entry whose window ended this long ago is not started late
 IDLE_S = 60.0
 
@@ -70,6 +78,8 @@ class ReleaseSettings:
     margin_cpi_pp: float
     margin_payrolls_k: float
     max_markets_per_series: int
+    poly_fomc: bool = True         # POLY_FOMC_ENABLED: trade the Polymarket "Fed Decision in <Month>?" brackets (paper only)
+    poly_max_no: int = 1           # POLY_FOMC_MAX_NO: dead brackets bought NO after the YES (0 = none)
 
 
 def settings(env=None) -> ReleaseSettings:
@@ -95,7 +105,9 @@ def settings(env=None) -> ReleaseSettings:
         poll_start_s=max(num("RELEASE_POLL_START_S", 2.0), 0.0), poll_every_s=num("RELEASE_POLL_EVERY_S", 1.5, 1.0),
         poll_max_s=num("RELEASE_POLL_MAX_S", 90.0, 1.0), daily_budget=int(num("RELEASE_BLS_DAILY_BUDGET", 400, 0)),
         margin_cpi_pp=num("RELEASE_MARGIN_CPI_PP", 0.02, 0.0), margin_payrolls_k=num("RELEASE_MARGIN_PAYROLLS_K", 10, 0.0),
-        max_markets_per_series=int(num("RELEASE_MAX_MARKETS_PER_SERIES", 1, 1)))
+        max_markets_per_series=int(num("RELEASE_MAX_MARKETS_PER_SERIES", 1, 1)),
+        poly_fomc=(e.get("POLY_FOMC_ENABLED") or "true").strip().lower() in ("1", "true", "yes", "on"),
+        poly_max_no=int(num("POLY_FOMC_MAX_NO", 1, 0)))
 
 
 # ---------------------------------------------------------------- series
@@ -107,6 +119,7 @@ class SeriesSpec:
     bls: tuple[str, ...] = ()    # BLS series id needed
     decimals: int | None = None  # rounding the market settles at (None: not a rounded number)
     scale: float = 1.0           # Kalshi strike unit per unit of our value (payrolls: persons per thousand)
+    venue: str = "kalshi"
 
 
 SERIES: dict[str, SeriesSpec] = {
@@ -116,6 +129,8 @@ SERIES: dict[str, SeriesSpec] = {
     "KXU3": SeriesSpec("KXU3", "jobs", "unemployment rate, seasonally adjusted", ("LNS14000000",), 1),
     "KXFED": SeriesSpec("KXFED", "fomc", "upper bound of the federal funds target range"),
     "KXFEDDECISION": SeriesSpec("KXFEDDECISION", "fomc", "change of the target range vs the prior range, bps"),
+    "POLYFED": SeriesSpec("POLYFED", "fomc", "Fed decision bracket, Polymarket (bps change of the upper bound)",
+                          venue="polymarket"),
 }
 
 
@@ -291,6 +306,10 @@ class ParsedMarket:
     more: bool = False               # custom: ">25"
     question: str = ""
     close_time: str = ""
+    venue: str = "kalshi"
+    bracket: str | None = None       # polymarket FOMC: cut_50 | cut_25 | hold | hike_25 | hike_50
+    yes_token: str = ""
+    no_token: str = ""
 
     def as_json(self) -> str:
         return json.dumps({k: v for k, v in self.__dict__.items()})
@@ -391,6 +410,8 @@ def market_in_release(series: str, rules: str, entry: CalendarEntry) -> bool:
 def resolves_yes(pm: ParsedMarket, v: float) -> bool:
     """Settlement of one market for the settled value `v`, from the strike fields (exclusive for "greater", see
     INCLUSIVITY_PROVEN). KXFEDDECISION markets take the change in bps."""
+    if pm.strike_type == "bracket":
+        return pm.bracket == poly_fomc.BRACKET_OF_BPS.get(int(v))
     if pm.strike_type == "custom":
         target = -pm.bps if pm.direction == "Cut" else pm.bps
         if pm.more:
@@ -409,7 +430,7 @@ def resolves_yes(pm: ParsedMarket, v: float) -> bool:
 
 def on_boundary(pm: ParsedMarket, v: float) -> bool:
     """True when the value sits on a bound of a market whose inclusivity no captured rules text proves."""
-    if pm.strike_type in INCLUSIVITY_PROVEN or pm.strike_type == "custom":
+    if pm.strike_type in INCLUSIVITY_PROVEN or pm.strike_type in ("custom", "bracket"):
         return False
     return any(b is not None and abs(b - v) < 1e-9 for b in (pm.floor, pm.cap))
 
@@ -584,6 +605,10 @@ class ReleaseScheduler:
         self._cal_error = ""
         self.closed_before: dict[str, int] = {}   # release id -> markets dropped because they close before the release
         self.requests = 0                 # GETs sent by this scheduler (any host), for --check and tests
+        self.poly_trace: dict[str, dict] = {}     # release id -> what the Polymarket discovery saw (for --check)
+        self.prior_check: dict[str, str] = {}     # release id -> one line about the prior_range verification
+        self._fill_ts: dict[str, float | None] = {}    # release id -> first fill time of the release
+        self._skipped: dict[str, int] = {}             # release id -> orders skipped by the pre-order re-checks
 
     def say(self, msg: str) -> None:
         if self.verbose:
@@ -640,8 +665,55 @@ class ReleaseScheduler:
             self._note(entry, "not_armed", "no_markets")
             self.say(f"{entry.release_id}: not armed (no Kalshi market with a matching rules text)")
             return None
+        if entry.kind == "fomc" and entry.prior_range is not None:
+            ok, why = await self.verify_prior_range(entry)
+            if not ok:
+                self._note(entry, "not_armed", why)
+                self.say(f"{entry.release_id}: not armed ({why})")
+                return None
+            self.say(f"{entry.release_id}: {self.prior_check.get(entry.release_id, 'prior_range verified')}")
         self._note(entry, "armed", "")
+        self.say(f"{entry.release_id}: armed ({', '.join(f'{k} {len(v)}' for k, v in markets.items())} markets)")
         return ArmedRelease(entry, entry.scheduled_ts(self.cfg.tz), markets, planned_requests(entry.kind, self.cfg))
+
+    async def verify_prior_range(self, entry: CalendarEntry) -> tuple[bool, str]:
+        """The calendar's prior_range must equal the range in force before the meeting: the new range of the newest
+        "FOMC statement" in the Fed feed dated strictly before the meeting day. (True, "") when they agree, else
+        (False, "prior_range_mismatch: ...") or (False, "prior_range_unverified: <reason>") (no item, foreign host, GET
+        error, text that does not parse). A disagreement or a doubt means the release is not armed."""
+        def unverified(why: str) -> tuple[bool, str]:
+            return False, f"prior_range_unverified: {why}"
+        try:
+            r = await self._get(FED_FEED_URL, headers={"User-Agent": USER_AGENT})
+            r.raise_for_status()
+            items = []
+            for e in feedparser.parse(r.content).entries:
+                pp = e.get("published_parsed")
+                if "fomc statement" not in (e.get("title") or "").lower() or not pp:
+                    continue
+                day = _feed_day(pp, self.cfg.tz)
+                if day < entry.date:
+                    items.append((day, e.get("link") or ""))
+            if not items:
+                return unverified("no earlier FOMC statement in the feed")
+            day, link = max(items, key=lambda x: x[0])
+            if urlparse(link).hostname != FED_HOST:
+                return unverified("the newest earlier statement does not link to the Fed website")
+            page = await self._get(link, headers={"User-Agent": USER_AGENT})
+            page.raise_for_status()
+            got = fomc_range(_clean(page.text))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            errors.capture(exc, "releases.prior_range")
+            return unverified(type(exc).__name__)
+        if got is None:
+            return unverified(f"the {day} statement did not parse to one range")
+        pr = entry.prior_range
+        if abs(got[0] - pr[0]) > 1e-9 or abs(got[1] - pr[1]) > 1e-9:
+            return False, f"prior_range_mismatch: statement says {got[0]:g} to {got[1]:g}"
+        self.prior_check[entry.release_id] = f"prior_range {pr[0]:g}-{pr[1]:g} verified against the {day} statement ({link})"
+        return True, ""
 
     # ----- Kalshi markets
     async def _get(self, url: str, **kw) -> httpx.Response:
@@ -658,6 +730,9 @@ class ReleaseScheduler:
             out[series] = []
             if series == "KXFEDDECISION" and entry.prior_range is None:
                 self.say(f"{series}: skipped (calendar entry has no prior_range)")
+                continue
+            if SERIES[series].venue == "polymarket":
+                out[series] = await self._load_polymarket(entry, series, t_rel)
                 continue
             for m in await self._series_markets(series):
                 rules = m.get("rules_primary") or ""
@@ -676,6 +751,50 @@ class ReleaseScheduler:
                         self.closed_before[entry.release_id] += 1
                         continue
                     out[series].append(pm)
+        return out
+
+    async def _load_polymarket(self, entry: CalendarEntry, series: str, t_rel: float) -> list[ParsedMarket]:
+        """Discover and store the Polymarket brackets of the meeting. Nothing is guessed: see poly_fomc."""
+        if not self.cfg.poly_fomc:
+            self.say(f"{series}: skipped (POLY_FOMC_ENABLED=false)")
+            return []
+        if entry.prior_range is None:
+            self.say(f"{series}: skipped (calendar entry has no prior_range)")
+            return []
+        if entry.date[:7] != entry.period:
+            self.say(f"{series}: skipped (period_date_mismatch: date {entry.date} vs period {entry.period})")
+            return []
+        trace: dict = {}
+        self.poly_trace[entry.release_id] = trace
+        try:
+            accepted, rejected = await poly_fomc.discover(self.http, self._get, entry, trace)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            errors.capture(exc, "releases.polyfed")
+            self.say(f"{series}: discovery failed ({type(exc).__name__}), skipped")
+            return []
+        trace["accepted"], trace["rejected"] = accepted, rejected
+        raw = trace.get("markets", {})
+        out: list[ParsedMarket] = []
+        for pm in accepted:
+            self.ledger.release_market_put(
+                market_id=pm.ticker, series=series, rules_primary=(raw.get(pm.ticker) or {}).get("description"),
+                strike_type="bracket", yes_sub_title=pm.question, template=series, parsed=pm.as_json(),
+                fetched_ts=self.now(), note=None)
+            ct = close_ts(pm.close_time)
+            if ct is None or ct <= t_rel:
+                self.closed_before[entry.release_id] += 1
+                continue
+            out.append(pm)
+        for mid, question, why in rejected:
+            if why == "ambiguous_event":
+                self.say(f"{series}: more than one matching event, nothing traded")
+            if not mid:
+                continue
+            self.ledger.release_market_put(
+                market_id=mid, series=series, rules_primary=(raw.get(mid) or {}).get("description"), strike_type="bracket",
+                yes_sub_title=question, template=None, parsed=None, fetched_ts=self.now(), note=why)
         return out
 
     async def _series_markets(self, series: str) -> list[dict]:
@@ -853,17 +972,24 @@ class ReleaseScheduler:
         wait = t - FOMC_LEAD_S - self.now()
         if wait > 0:
             await self.sleep(wait)
-        rng, text, link = await self.poll_fomc(entry, t)
+        self._note(entry, "polling", "")          # before the first request: a restart inside the window never re-arms
+        rng, text, link, timing = await self.poll_fomc(entry, t)
         warm.cancel()
-        fetched = self.now()
+        seen = timing["seen_ts"]
+        fetched = seen if seen is not None else self.now()
         if text is None:
-            self._note(entry, "timed_out", "no statement in the feed")
+            self._note(entry, "timed_out", "request_cap" if timing.get("capped") else "no statement in the feed")
             return "timed_out"
         if rng is None:
             self._note(entry, "parse_doubt", "statement did not parse to exactly one 25 bp range", fetched_ts=fetched)
             self.say(f"{entry.release_id}: parse_doubt, no trade")
             return "parse_doubt"
         lo, hi = rng
+        info = {"range": [lo, hi], "prior_range": entry.prior_range, "url": link, "source": timing["source"],
+                "statement_seen_ts": seen, "seen_lag_s": seen - t, "polls": timing["polls"], "requests": timing["requests"]}
+        self.ledger.release_put(id=entry.release_id, kind=entry.kind, series=",".join(series_for(entry.kind)),
+                                period=entry.period, scheduled_ts=t, fetched_ts=fetched, value=hi, raw=json.dumps(info),
+                                status="computed", note="")
         if entry.prior_range is not None:
             delta = hi - entry.prior_range[1]
             frm = fomc_from_range(text)
@@ -877,18 +1003,58 @@ class ReleaseScheduler:
         values: dict[str, float] = {"KXFED": hi}
         if entry.prior_range is not None:
             values["KXFEDDECISION"] = float(round((hi - entry.prior_range[1]) * 100))
-        raw = json.dumps({"range": [lo, hi], "prior_range": entry.prior_range, "url": link})
-        traded = await self._trade_values(armed, values, fetched, raw, url=link)
-        self._note(entry, "done", f"{traded} traded", fetched_ts=fetched, raw=raw, value=hi)
+            values["POLYFED"] = values["KXFEDDECISION"]
+        decided = self.now()
+        traded = await self._trade_values(armed, values, fetched, json.dumps(info), url=link)
+        first = self._fill_ts.pop(entry.release_id, None)
+        skipped = self._skipped.pop(entry.release_id, 0)
+        info.update(decided_ts=decided, decided_lag_s=decided - t, first_fill_ts=first,
+                    first_fill_lag_s=(first - t) if first is not None else None)
+        raw = json.dumps(info)
+        self.say(f"{entry.release_id} timing: statement seen T{seen - t:+.1f}s ({timing['source']}), decided "
+                 f"T{decided - t:+.1f}s, " + (f"first fill T{first - t:+.1f}s, " if first is not None else "no fill, ")
+                 + f"{timing['polls']} polls / {timing['requests']} GETs")
+        self._note(entry, "done", f"{traded} traded, {skipped} skipped", fetched_ts=fetched, raw=raw, value=hi)
         return "done"
 
     async def poll_fomc(self, entry: CalendarEntry, t_release: float):
-        """(range | None, statement text | None, link): poll the Fed statement feed (conditional GET) until a statement
-        dated today appears or FOMC_MAX_S passes."""
+        """(range | None, statement text | None, link, timing). Each round asks the Fed twice: the statement URL for the
+        meeting day (404 until it is posted) and the press feed (conditional GET). The first source that yields a
+        statement wins. timing = {seen_ts, source ("url" | "feed" | None), polls, requests[, capped]}."""
+        start = self.now()
+        start_requests = self.requests
+        end = start + FOMC_MAX_S
+        url = FED_STATEMENT_URL.format(ymd=entry.date.replace("-", ""))
         etag = None
-        end = self.now() + FOMC_MAX_S
-        today = entry.date
+        polls = 0
+        timing = {"seen_ts": None, "source": None, "polls": 0, "requests": 0}
+
+        def capped() -> bool:
+            return self.requests - start_requests >= FOMC_MAX_REQUESTS
+
+        def done(rng, text, link, source):
+            timing.update(seen_ts=self.now(), source=source, polls=polls, requests=self.requests - start_requests)
+            return rng, text, link, timing
+
+        nxt = start
         while self.now() < end:
+            if capped():
+                break
+            polls += 1
+            try:
+                r = await self._get(url, headers={"User-Agent": USER_AGENT})
+                if r.status_code == 200:
+                    text = _clean(r.text)
+                    if FOMC_RE.search(text):
+                        return done(fomc_range(text), text, url, "url")
+                elif r.status_code != 404:
+                    r.raise_for_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors.capture(exc, "releases.fomc")
+            if capped():
+                break
             try:
                 h = {"User-Agent": USER_AGENT}
                 if etag:
@@ -900,22 +1066,30 @@ class ReleaseScheduler:
                         if "fomc statement" not in (e.get("title") or "").lower():
                             continue
                         pp = e.get("published_parsed")
-                        if not pp:
-                            continue
-                        if _feed_day(pp, self.cfg.tz) != today:
+                        if not pp or _feed_day(pp, self.cfg.tz) != entry.date:
                             continue
                         link = e.get("link") or ""
+                        if urlparse(link).hostname != FED_HOST:
+                            continue
+                        if capped():
+                            break
                         page = await self._get(link, headers={"User-Agent": USER_AGENT})
                         page.raise_for_status()
                         text = _clean(page.text)
-                        return fomc_range(text), text, link
-                    etag = new_etag or etag    # remembered only once every item was handled: a failed page GET is retried
+                        return done(fomc_range(text), text, link, "feed")
+                    else:
+                        etag = new_etag or etag    # remembered only once every item was handled: a failed page GET is retried
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 errors.capture(exc, "releases.fomc")
-            await self.sleep(FOMC_POLL_S)
-        return None, None, ""
+            every = FOMC_FAST_POLL_S if self.now() < start + FOMC_FAST_WINDOW_S else FOMC_POLL_S
+            nxt = max(nxt + every, self.now())
+            gap = nxt - self.now()
+            if gap > 0:
+                await self.sleep(gap)
+        timing.update(polls=polls, requests=self.requests - start_requests, capped=capped())
+        return None, None, "", timing
 
     # ----- books and trades
     def _warm_books(self, armed: ArmedRelease) -> asyncio.Task:
@@ -926,14 +1100,17 @@ class ReleaseScheduler:
 
     @staticmethod
     def _market(pm: ParsedMarket) -> dict:
+        if pm.venue == "polymarket":
+            return {"venue": "polymarket", "id": pm.ticker, "question": pm.question, "category": "Economics",
+                    "yes_token": pm.yes_token, "no_token": pm.no_token}
         return {"venue": "kalshi", "id": pm.ticker, "question": pm.question, "category": "Economics"}
 
-    async def fresh_books(self, pms: list[ParsedMarket]) -> dict[str, Book]:
-        """Fresh books for the candidates, waiting at most LIVE_QUOTE_WAIT_MS (the same bounded wait as the news path).
-        Books that did not land in time are simply not candidates."""
+    async def fresh_books(self, pms: list[ParsedMarket], wait_s: float | None = None) -> dict[str, Book]:
+        """Fresh books for the candidates, waiting at most LIVE_QUOTE_WAIT_MS (the same bounded wait as the news path;
+        `wait_s` overrides it). Books that did not land in time are simply not candidates."""
         tasks = {pm.ticker: asyncio.ensure_future(self.fetch_book(self.http, self._market(pm))) for pm in pms}
         if tasks:
-            await asyncio.wait(set(tasks.values()), timeout=self.quote_wait_s)
+            await asyncio.wait(set(tasks.values()), timeout=self.quote_wait_s if wait_s is None else wait_s)
         out = {}
         for tk, task in tasks.items():
             if task.done() and not task.cancelled() and task.exception() is None:
@@ -962,6 +1139,101 @@ class ReleaseScheduler:
         picks.sort(key=lambda x: 1 - x[3], reverse=True)
         return picks[: self.cfg.max_markets_per_series]
 
+    def rank_brackets(self, value: float, books: dict[str, Book], pms: list[ParsedMarket]
+                      ) -> list[tuple[ParsedMarket, str, Book, float]]:
+        """Polymarket brackets worth buying for the settled bps change `value`: the resolving bracket on YES first (it
+        needs a book, a YES ask below MAX_ENTRY_PRICE and a YES bid), then up to cfg.poly_max_no dead brackets on NO, most
+        room first (lowest NO ask), each needing a NO ask below MAX_ENTRY_PRICE and a NO bid. A book with no ask or no bid
+        on the wanted side is one-sided and skipped. A value outside the bracket map, or a resolving bracket that is not
+        among the markets, ranks nothing: a dead bracket is only known dead when the live one is."""
+        if not any(resolves_yes(pm, value) for pm in pms):
+            return []
+
+        def usable(bk, side):
+            ask, bid = bk.best(side), bk.bid(side)
+            return ask is not None and ask < MAX_ENTRY_PRICE and bid is not None and bid > 0
+
+        picks, nos = [], []
+        for pm in pms:
+            bk = books.get(pm.ticker)
+            if bk is None:
+                continue
+            if resolves_yes(pm, value):
+                if usable(bk, "yes"):
+                    picks.append((pm, "yes", bk, bk.best("yes")))
+            elif usable(bk, "no"):
+                nos.append((pm, "no", bk, bk.best("no")))
+        nos.sort(key=lambda x: x[3])
+        return picks + nos[: max(self.cfg.poly_max_no, 0)]
+
+    async def _snapshot_books(self, release_id: str, pms: list[ParsedMarket], t0: float) -> None:
+        """release_books rows at +5, +30 and +60 s after the decision: what the market did after the number came out."""
+        for h in RELEASE_BOOK_HORIZONS_S:
+            gap = t0 + h - self.now()
+            if gap > 0:
+                await self.sleep(gap)
+            res = await asyncio.gather(*(self.fetch_book(self.http, self._market(pm)) for pm in pms), return_exceptions=True)
+            for pm, bk in zip(pms, res):
+                if not isinstance(bk, BaseException):
+                    self._book_row(release_id, pm, f"+{h}s", self.now(), bk)
+
+    def _book_row(self, release_id: str, pm: ParsedMarket, label: str, ts: float, bk: Book) -> None:
+        self.ledger.release_book_put(
+            release_id=release_id, market_id=pm.ticker, label=label, ts=ts, yes_bid=bk.bid("yes"), yes_ask=bk.best("yes"),
+            bid_qty=bk.no_asks[0][1] if bk.no_asks else None, ask_qty=bk.yes_asks[0][1] if bk.yes_asks else None)
+
+    async def _trade_polyfed(self, armed: ArmedRelease, pms: list[ParsedMarket], value: float, fetched: float, raw: str,
+                             url: str) -> tuple[int, int]:
+        """YES on the resolving Polymarket bracket, NO on at most poly_max_no dead ones. Paper only. Before each order:
+        the market must still accept orders and a fresh two-sided book must exist. Returns (traded, skipped)."""
+        entry, t = armed.entry, armed.scheduled_ts
+        books = await self.fresh_books(pms, wait_s=poly_fomc.POLY_BOOK_WAIT_S)
+        now = self.now()
+        for pm in pms:
+            if pm.ticker in books:
+                self._book_row(entry.release_id, pm, "decision", now, books[pm.ticker])
+        task = asyncio.create_task(self._snapshot_books(entry.release_id, pms, now))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        traded = skipped = 0
+        spec = SERIES["POLYFED"]
+        for i, (pm, side, _bk, _px) in enumerate(self.rank_brackets(value, books, pms)):
+            try:
+                ok, why = await poly_fomc.still_open(self.http, self._get, pm.ticker)
+                fresh = None
+                if ok:
+                    fresh = await asyncio.wait_for(self.fetch_book(self.http, self._market(pm)), poly_fomc.POLY_BOOK_WAIT_S)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors.capture(exc, "releases.polyfed.recheck")
+                ok, why, fresh = False, f"recheck_failed: {type(exc).__name__}", None
+            if not ok:
+                self.say(f"POLYFED {pm.ticker}: skipped ({why})")
+                skipped += 1
+                continue
+            if fresh.best(side) is None or (fresh.bid(side) or 0) <= 0:
+                self.say(f"POLYFED {pm.ticker}: skipped (poly_book_one_sided)")
+                skipped += 1
+                continue
+            if (close_ts(pm.close_time) or 0) <= self.now():
+                self.say(f"POLYFED {pm.ticker}: skipped (closed)")
+                skipped += 1
+                continue
+            ev = {"id": f"release-POLYFED-{entry.period}" + (f"-m{i}" if i else ""), "source": "release:POLYFED",
+                  "headline": f"{entry.kind.upper()} {entry.period}: {spec.statistic} = {value:g}",
+                  "summary": raw[:500], "url": url, "published_ts": t, "seen_ts": fetched, "synthetic": False}
+            rec = await self.trade(ev, self._market(pm), side, fresh, value, n_candidates=len(pms), style="take")
+            traded += 1
+            self._first_fill(entry, rec)
+        self._skipped[entry.release_id] = self._skipped.get(entry.release_id, 0) + skipped
+        return traded, skipped
+
+    def _first_fill(self, entry: CalendarEntry, rec) -> None:
+        fts = rec.get("fill_ts") if isinstance(rec, dict) else None
+        if fts is not None and self._fill_ts.get(entry.release_id) is None:
+            self._fill_ts[entry.release_id] = fts
+
     async def _trade_values(self, armed: ArmedRelease, values: dict[str, float], fetched: float, raw: str,
                             url: str = "") -> int:
         entry, t = armed.entry, armed.scheduled_ts
@@ -973,6 +1245,10 @@ class ReleaseScheduler:
             pms = [pm for pm in pms if (close_ts(pm.close_time) or 0) > self.now()]     # still open right now
             if not pms:
                 continue
+            if SERIES[series].venue == "polymarket":
+                n, _skipped = await self._trade_polyfed(armed, pms, value, fetched, raw, url)
+                traded += n
+                continue
             books = await self.fresh_books(pms)
             picks = self.rank(entry, series, value, books, pms)
             for i, (pm, side, bk, _px) in enumerate(picks):
@@ -983,7 +1259,7 @@ class ReleaseScheduler:
                       "headline": f"{entry.kind.upper()} {entry.period}: {spec.statistic} = {value:g}",
                       "summary": raw[:500], "url": url or BLS_URL.format(series=spec.bls[0] if spec.bls else series),
                       "published_ts": t, "seen_ts": fetched, "synthetic": False}
-                await self.trade(ev, self._market(pm), side, bk, value, n_candidates=len(pms))
+                self._first_fill(entry, await self.trade(ev, self._market(pm), side, bk, value, n_candidates=len(pms)))
                 traded += 1
         return traded
 
@@ -1042,6 +1318,21 @@ def _feed_day(parsed, tz: ZoneInfo) -> str:
 
 
 # ---------------------------------------------------------------- CLI
+def _check_polyfed(sched, e: CalendarEntry, out) -> None:
+    """POLYFED discovery table for --check: event slug, each market id, bracket, acceptingOrders, endDate, or why not."""
+    tr = sched.poly_trace.get(e.release_id)
+    if tr is None:
+        out("  POLYFED: not looked up (POLY_FOMC_ENABLED=false or no prior_range)")
+        return
+    out(f"  POLYFED event: {', '.join(tr.get('slugs') or []) or 'none found'}")
+    raw = tr.get("markets", {})
+    for pm in tr.get("accepted", []):
+        m = raw.get(pm.ticker, {})
+        out(f"    {pm.ticker:10} {pm.bracket:8} acceptingOrders {str(m.get('acceptingOrders')).lower():5} endDate {pm.close_time}")
+    for mid, q, why in tr.get("rejected", []):
+        out(f"    {mid or '-':10} rejected: {why} {q[:70]}")
+
+
 async def check(day: str | None, cfg: ReleaseSettings, calendar_path: Path = CALENDAR_PATH, ledger=None,
                 http: httpx.AsyncClient | None = None, out=print) -> int:
     """`--check`: print the calendar for the day, what the rules texts of its Kalshi markets parse to, the BLS key and
@@ -1083,7 +1374,12 @@ async def check(day: str | None, cfg: ReleaseSettings, calendar_path: Path = CAL
                 pms = markets.get(series) or []
                 out(f"  {series}: {len(pms)} markets with a matching rules template")
                 for pm in pms[:20]:
-                    out(f"    {pm.ticker:32} {pm.strike_type:8} floor {pm.floor} cap {pm.cap}")
+                    out(f"    {pm.ticker:32} {pm.strike_type:8} " + (f"bracket {pm.bracket}" if pm.bracket else f"floor {pm.floor} cap {pm.cap}"))
+            if e.kind == "fomc":
+                _check_polyfed(sched, e, out)
+                if e.prior_range is not None:
+                    ok, why = await sched.verify_prior_range(e)
+                    out("  prior_range check: " + (sched.prior_check.get(e.release_id, "verified") if ok else f"NOT verified, {why}"))
             if e.kind in ("cpi", "jobs") and cfg.bls_key:
                 base = await sched.baseline(e)
                 for sid, pts in (base or {}).items():
@@ -1097,13 +1393,163 @@ async def check(day: str | None, cfg: ReleaseSettings, calendar_path: Path = CAL
     return sched.requests
 
 
+class _VirtualClock:
+    """Fake time for the rehearsal. sleep() parks the caller until every other task is idle, then time jumps to the
+    earliest wake-up, so concurrent sleepers (the polling loop, the book snapshots) interleave as they would live."""
+
+    def __init__(self, t: float):
+        self.t = t
+        self._heap: list = []
+        self._n = 0
+
+    def __call__(self) -> float:
+        return self.t
+
+    async def sleep(self, s: float) -> None:
+        if s <= 0:
+            await asyncio.sleep(0)
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._n += 1
+        heapq.heappush(self._heap, (self.t + s, self._n, fut))
+        await fut
+
+    async def drive(self, main: asyncio.Task, idle_rounds: int = 60, max_steps: int = 200000) -> None:
+        for _ in range(max_steps):
+            for _ in range(idle_rounds):
+                await asyncio.sleep(0)
+            if self._heap:
+                wake, _n, fut = heapq.heappop(self._heap)
+                self.t = max(self.t, wake)
+                if not fut.done():
+                    fut.set_result(None)
+            elif main.done():
+                return
+        raise RuntimeError("rehearsal clock did not settle")
+
+
+REHEARSE_FILES = ("meta.json", "search-2026-10.json", "event-2026-10.json", "statement-2026-09-16.html",
+                  "statement-2026-07-29.html")
+
+
+async def rehearse(kind: str, fixtures: Path, out=print) -> int:
+    """`--rehearse fomc`: replay a whole FOMC release on a fake clock against the captured responses. No network, a
+    temp ledger, nothing is sent. The captured statement is played as if it were this meeting's statement, with the
+    prior range it moved from, so the bracket the engine must buy is known (meta.expected_bracket)."""
+    import contextlib
+    import io
+    import tempfile
+    if kind != "fomc":
+        out(f"unknown rehearsal {kind!r} (only: fomc)")
+        return 2
+    fx = Path(fixtures)
+    for name in REHEARSE_FILES:
+        if not (fx / name).exists():
+            out(f"fixture missing: {name}")
+            return 2
+    meta = json.loads((fx / "meta.json").read_text())
+    for name in ("books",):
+        if not (fx / name).is_dir():
+            out(f"fixture missing: {name}/")
+            return 2
+    from fastlane.engine import Engine
+    from fastlane.ledger import Ledger
+
+    class _NoJev:
+        async def keepalive(self):
+            return None
+
+        async def aclose(self):
+            return None
+
+        async def decide(self, *a, **k):
+            raise RuntimeError("the rehearsal never calls Jev")
+
+    tz = ZoneInfo(ET)
+    entry = CalendarEntry("fomc", meta["meeting_date"], "14:00", meta["period"],
+                          prior_range=tuple(meta["prior_range_for_statement"]))
+    t_rel = entry.scheduled_ts(tz)
+    clock = _VirtualClock(t_rel - MARKETS_LEAD_S - 10)
+    transport = poly_fomc.fixture_transport(fx, clock, t_rel)
+    cfg = settings({"POLY_FOMC_ENABLED": "true", "POLY_FOMC_MAX_NO": os.environ.get("POLY_FOMC_MAX_NO") or "1"})
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        ledger = Ledger(Path(td) / "ledger.db")
+        calendar = Path(td) / "calendar.json"
+        calendar.write_text(json.dumps({"version": 1, "events": [
+            {"kind": "fomc", "date": entry.date, "time_et": entry.time_et, "period": entry.period,
+             "prior_range": list(entry.prior_range)}]}))
+        with contextlib.redirect_stdout(buf):
+            eng = Engine(workers=1, verbose=True, ledger=ledger, jev=_NoJev())
+            await eng.http.aclose()
+            eng.http = httpx.AsyncClient(transport=transport)
+            eng.tape_enabled = False
+            async def trade(*a, **k):
+                rec = dict(await eng.trade_release(*a, **k))
+                if rec.get("fill_ts") is not None:
+                    rec["fill_ts"] = clock()           # the engine stamps wall time: put the fill on the fake clock
+                return rec
+
+            sched = ReleaseScheduler(eng.ledger, eng.http, trade, lambda c, m: fetch_book(c, m), cfg=cfg,
+                                     calendar_path=calendar, now=clock, sleep=clock.sleep, verbose=True)
+            main_task = asyncio.create_task(sched.run_release(entry))
+            driver = asyncio.create_task(clock.drive(main_task))
+            try:
+                await driver
+                status = main_task.result() if main_task.done() else "unfinished"
+            finally:
+                for t in list(eng._bg) + list(sched._tasks) + [main_task]:
+                    t.cancel()
+                await asyncio.gather(*list(eng._bg), *list(sched._tasks), return_exceptions=True)
+                await eng.http.aclose()
+        console = buf.getvalue().splitlines()
+        trades = ledger.db.execute("SELECT market_id, side, contracts, avg_price, cost, fee, entry_style, venue, book "
+                                   "FROM trades ORDER BY id").fetchall()
+        brackets = {mid: (json.loads(p).get("bracket") if p else None, note) for mid, p, note in ledger.db.execute(
+            "SELECT market_id, parsed, note FROM release_markets WHERE series = 'POLYFED'")}
+        rows = ledger.release_books(entry.release_id)
+        rel = ledger.release_get(entry.release_id) or {}
+        ledger.db.close()
+    out("REHEARSAL (fake clock, fixture network, temp ledger; nothing is sent)")
+    out(f"meeting {entry.date} 14:00 ET, release {entry.release_id}, prior range {entry.prior_range[0]:g}-"
+        f"{entry.prior_range[1]:g} (the range the replayed statement moved from)")
+    out("console:")
+    for line in console:
+        out("  " + line.strip())
+    out("POLYFED brackets discovered:")
+    for mid, (br, note) in sorted(brackets.items()):
+        out(f"  {mid}  {br or '-':8} {('rejected: ' + note) if note else 'accepted'}")
+    out(f"prior range check: {sched.prior_check.get(entry.release_id, 'not verified')}")
+    out("trades (market, side, contracts, avg_price, cost, fee, entry_style):")
+    for mid, side, n, px, cost, fee, style, venue, book in trades:
+        out(f"  {mid} {side.upper()} {n:g} @ {px} cost ${cost:.2f} fee ${fee:.2f} {style} [{venue}, {book} book] "
+            f"bracket {brackets.get(mid, ('?',))[0]}")
+    out("release_books (market, label, yes_bid/yes_ask, bid_qty/ask_qty):")
+    for b in rows:
+        out(f"  {b['market_id']} {b['label']:8} {b['yes_bid']}/{b['yes_ask']}  {b['bid_qty']}/{b['ask_qty']}")
+    out(f"release row: status {rel.get('status')}, note {rel.get('note')!r}")
+    out("Polymarket trades are paper only: no Polymarket order client exists (live.gate -> paper_only_market)")
+    yes = [m for m, side, *_ in trades if side == "yes"]
+    if status != "done" or len(yes) != 1 or brackets.get(yes[0], (None,))[0] != meta["expected_bracket"]:
+        out(f"FAIL: expected one YES trade on bracket {meta['expected_bracket']}, status {status}, "
+            f"YES trades {[brackets.get(m, (None,))[0] for m in yes]}")
+        return 1
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Scheduled data releases: read-only checks")
     ap.add_argument("--check", action="store_true", help="print calendar, market parse table, BLS key and budget")
     ap.add_argument("--date", help="YYYY-MM-DD (ET); default today")
+    ap.add_argument("--rehearse", choices=["fomc"], help="replay a whole release on a fake clock from captured responses "
+                                                        "(no network, temp ledger, nothing sent)")
+    ap.add_argument("--fixtures", help="fixture folder for --rehearse (default tests/fixtures/polymarket_fomc)")
     a = ap.parse_args(argv)
     from fastlane.config import load_env
     load_env()
+    if a.rehearse:
+        fixtures = Path(a.fixtures) if a.fixtures else ROOT / "tests" / "fixtures" / "polymarket_fomc"
+        return asyncio.run(rehearse(a.rehearse, fixtures))
     if not a.check:
         ap.print_help()
         return 0

@@ -337,6 +337,8 @@ const REASONS = {
   post_working: "Resting order placed", post_expired: "Resting order expired", post_queue_full: "Too many working orders",
   sports_market: "Sports market", release_yes: "Bought YES on data release", release_no: "Bought NO on data release",
   release_margin: "Too close to the strike", rules_mismatch: "Market rules not recognised",
+  not_accepting: "Market not accepting orders", other_meeting: "Another meeting", parse_doubt: "Statement not understood",
+  prior_range_mismatch: "Prior range disagrees", prior_range_unverified: "Prior range not verified",
 };
 const SVGNS = "http://www.w3.org/2000/svg";
 const BUCKET_ORDER = ["<0.60", "0.60-0.70", "0.70-0.85", "0.85+", "unknown"];
@@ -546,7 +548,7 @@ function card(t) {
   const h3 = el("h3", null, t.question, { title: t.question });
   const sideRow = el("div", "row");
   sideRow.append(el("span", "big " + (yes ? "pos" : "neg"), yes ? "YES" : "NO"),
-                 el("span", "dim", cents(t.entry_price) + " > "), el("span", "big", cents(t.now_price)),
+                 el("span", "dim", cents(t.entry_price) + " > "), el("span", t.no_bid ? "big neg" : "big", t.no_bid ? "no bid" : cents(t.now_price), t.no_bid ? { title: "No bid on the held side: valued at 0" } : undefined),
                  el("span", "big r " + signClass(t.move_cents), moveStr(t.move_cents), { style: "margin-left:auto" }));
   const minis = el("div", "minis");
   minis.append(
@@ -620,7 +622,7 @@ function trRow(t, isNew) {
     td(t.side.toUpperCase(), t.side === "yes" ? "pos" : "neg"),
     td(Number(t.contracts).toLocaleString("en-US", { maximumFractionDigits: 2 }), "r"),
     td(cents(t.entry_price), "r", { title: entryTitle(t) }),
-    td(cents(t.now_price), "r"),
+    td(t.no_bid ? "no bid" : cents(t.now_price), "r" + (t.no_bid ? " neg" : ""), t.no_bid ? { title: "No bid on the held side: valued at 0" } : undefined),
     td(moveStr(t.move_cents), "r " + signClass(t.move_cents)),
     td(sMoney(t.pnl), "r " + signClass(t.pnl)),
     td(sPct(t.pnl_pct), "r " + signClass(t.pnl)),

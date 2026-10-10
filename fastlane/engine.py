@@ -9,6 +9,7 @@ now) or a resting paper order (the orders module). Only a LIVE-book take fill ca
 """
 import asyncio
 import os
+import signal
 import sqlite3
 import time
 
@@ -28,7 +29,7 @@ from fastlane.live import LiveTrader
 from fastlane.orders import PaperOrders
 from fastlane.ratelimit import JevBudget, env_float
 from fastlane.universe import Universe, is_sports_market
-from fastlane.x_feed import XFeed
+from fastlane.x_feed import XFeed, days_label
 
 MARK_HORIZONS_S = [5, 30, 60, 300, 900, 3600]
 PREFETCH_BOOKS = 8          # fetch every candidate book while Jev is thinking (requests are cheap, waits are not)
@@ -66,6 +67,40 @@ def _quotes_cell(rec: dict) -> str:
     return f"{w:.0f}ms/{rec.get('n_live_quotes', 0)}" if w is not None else "-"
 
 
+def install_stop_signals(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> list[int]:
+    """SIGTERM and SIGINT set `stop` so run.py can leave its loop and run Engine.stop() (which clears the heartbeat).
+    The first signal also restores the default handlers, so a second Ctrl-C (or SIGTERM) during a slow shutdown forces
+    exit. Falls back to signal.signal plus call_soon_threadsafe where the loop cannot add signal handlers. Returns the
+    signals. (A signal that arrives while Engine.start() runs is honoured once start returns.)"""
+    sigs = (signal.SIGTERM, signal.SIGINT)
+    use_loop = {}
+
+    def restore():
+        for sig in sigs:
+            if use_loop.get(sig):
+                try:
+                    loop.remove_signal_handler(sig)
+                except Exception:
+                    pass
+            else:
+                signal.signal(sig, signal.default_int_handler if sig == signal.SIGINT else signal.SIG_DFL)
+
+    def first():
+        restore()
+        stop.set()
+
+    installed = []
+    for sig in sigs:
+        try:
+            loop.add_signal_handler(sig, first)
+            use_loop[sig] = True
+        except (NotImplementedError, RuntimeError):
+            use_loop[sig] = False
+            signal.signal(sig, lambda *_a: loop.call_soon_threadsafe(first))
+        installed.append(int(sig))
+    return installed
+
+
 class PrefetchPool:
     """The prefetched book tasks that the shadow and starter passes share (read only: nobody pops a task another pass may
     still need). Each pass calls acquire() when it is handed the pool and release() when it finishes; the LAST release
@@ -92,7 +127,7 @@ class PrefetchPool:
 
 
 class Engine:
-    def __init__(self, workers: int = 8, verbose: bool = True):
+    def __init__(self, workers: int = 8, verbose: bool = True, ledger=None, jev=None):
         self.bankroll = float(os.environ.get("PAPER_BANKROLL_USD", 10000))
         self.max_trade = self.bankroll * float(os.environ.get("PAPER_MAX_TRADE_PCT", 0.02))
         self.halt_loss = self.bankroll * float(os.environ.get("PAPER_DAILY_LOSS_HALT_PCT", 0.05))
@@ -105,11 +140,11 @@ class Engine:
         self.verbose = verbose
         self.queue: asyncio.Queue = asyncio.Queue()
         self.feed_stats: dict = {}
-        self.jev = JevClient()
+        self.jev = jev if jev is not None else JevClient()
         self.http = httpx.AsyncClient(http2=True, timeout=httpx.Timeout(5.0, connect=3.0),
                                       limits=httpx.Limits(max_keepalive_connections=20))
         self.universe = Universe()
-        self.ledger = Ledger()
+        self.ledger = ledger if ledger is not None else Ledger()
         self.hub = FeedHub(self.queue, self.feed_stats)
         self.xfeed = XFeed(self.queue, self.feed_stats, self.ledger)       # off without XAI_API_KEY
         self.bsky = BlueskyFeed(self.queue, self.feed_stats, self.ledger)  # keyless; BSKY_ENABLED=false turns it off
@@ -120,10 +155,11 @@ class Engine:
         self.live = LiveTrader(self.ledger, self.kalshi, self.http)
         self.live_orders = 0
         self.tape_enabled = self.kalshi.configured
+        self.deny_re = move_deny_re()      # count and price ladders: no move event, and not a candidate of one
         self.tape = KalshiTape(self.ledger, universe_ids=lambda: self.kalshi_ids,
                                market_info=self.by_id.get, on_move=self._on_move,
                                sign_headers=self.kalshi.sign_headers if self.tape_enabled else None,
-                               deny_re=move_deny_re(),
+                               deny_re=self.deny_re,
                                on_tick=lambda ticker, ts, bid, ask: self.orders.on_tick(ticker, ts, bid, ask))
         self.styles = entry_styles()                # {"live", "shadow", "starter"} -> "take" | "post"
         self.quote_wait_s = max(env_float("LIVE_QUOTE_WAIT_MS", 150), 0.0) / 1000
@@ -208,7 +244,7 @@ class Engine:
                 s = self.xfeed.settings
                 self._tasks.append(asyncio.create_task(self.xfeed.run()))
                 print(f"x feed: {len(s.handles)} handles every {s.poll_seconds:.0f}s, window {s.start:%H:%M}-{s.end:%H:%M} "
-                      f"{s.tz.key} on {len(s.days)} weekdays, budget ${s.budget_usd:.2f}/UTC day")
+                      f"{s.tz.key} {'every day' if len(s.days) == 7 else 'on ' + days_label(s.days)}, budget ${s.budget_usd:.2f}/UTC day")
             else:
                 self.ledger.feed_status_set("x", connected=False, info={"enabled": False})   # never stay stuck at enabled
                 print("x feed off (no XAI_API_KEY)")
@@ -358,6 +394,8 @@ class Engine:
         cands = self.universe.shortlist(f"{ev['headline']} {ev.get('summary', '')}")
         if ev.get("exclude_series"):  # a market move must not "predict" its own series (any event of the same ladder family)
             cands = [m for m in cands if not (m["venue"] == "kalshi" and m["id"].split("-", 1)[0] == ev["exclude_series"])]
+        if ev.get("source") == "kalshi_move":   # a count or price ladder is never a candidate of a move event (news events keep them)
+            cands = [m for m in cands if not (self.deny_re.search(m.get("question") or "") or self.deny_re.search(str(m.get("id") or "")))]
         shortlist_ms = (time.perf_counter() - t0) * 1000
         rec = {"n_candidates": len(cands), "shortlist_ms": shortlist_ms}
 
@@ -698,10 +736,12 @@ class Engine:
                   f"(take was {order['take_price']}): {(order.get('market_question') or '')[:80]}")
 
     # ---------- scheduled data releases ----------
-    async def trade_release(self, ev: dict, market: dict, side: str, bk: Book, value, n_candidates: int = 1) -> dict:
+    async def trade_release(self, ev: dict, market: dict, side: str, bk: Book, value, n_candidates: int = 1,
+                            style: str | None = None) -> dict:
         """A number just came out and `market` settles on it: enter in the LIVE paper book (no Jev). Same sizing, same
         guards, same entry style and the same route to a real order as any other LIVE trade (three locks, caps,
-        NO-side rule). Called by the release scheduler."""
+        NO-side rule). `style` overrides the LIVE entry style (the scheduler passes "take" for Polymarket). Called by the
+        release scheduler. The record carries `filled` and, on a fill, `fill_ts`."""
         self.ledger.event(ev)
         rec = {"n_candidates": n_candidates, "shortlist_ms": 0.0, "venue": market["venue"], "market_id": market["id"],
                "market_question": market["question"], "market_conf": 1.0, "materiality": 1.0,
@@ -715,7 +755,7 @@ class Engine:
         fill = None
         blocked, res = await self._execute(
             "live", ev, market, side, bk, self.max_trade, strength=1.0, decisive=1.0,
-            mid_at_published=rec["mid_at_published"], style=self.styles["live"], source_tag=ev["source"])
+            mid_at_published=rec["mid_at_published"], style=style or self.styles["live"], source_tag=ev["source"])
         if blocked:
             rec["reason"] = blocked
             if blocked in COST_BLOCK_REASONS:
@@ -724,14 +764,20 @@ class Engine:
             rec["reason"] = "post_working"
         else:
             fill = res
+        fill_ts = time.time() if fill else None
         rec["total_ms"] = max(0.0, (time.time() - (ev.get("published_ts") or ev["seen_ts"])) * 1000)   # T to fill
         if fill:
             if self.verbose:
                 print(f"{'':16}** RELEASE FILL {rec['action']} {fill['contracts']} @ {fill['avg_price']} "
                       f"[{ev['source']}] {ev['headline'][:60]}")
-            await self._real_order(ev, market, side, fill)
-        out = self._finish(ev, rec, fill)
+        # No await between the trade row (written inside _execute) and the decision row: a cancellation can no longer leave
+        # a trade without its decision. The real order (a no-op unless the three locks are open) follows the paper records.
+        out = dict(self._finish(ev, rec, fill))        # the decision row is written; timing fields are for the caller only
+        out["filled"] = fill is not None
+        out["fill_ts"] = fill_ts
         self.ledger.mark(ev["id"], 0, bk.best("yes"), bk.bid("yes"), bk.mid())
+        if fill:
+            await self._real_order(ev, market, side, fill)
         self._spawn(self._marks(ev["id"], market))
         return out
 
@@ -786,6 +832,9 @@ class Engine:
         pnl = 0.0
         for side, n, cost, fee, yb, ya in rows:
             exit_px = yb if side == "yes" else (1 - ya if ya is not None else None)
+            if exit_px is None and ((side == "yes" and ya is not None) or (side == "no" and yb is not None)):
+                exit_px = 0.0           # the other column exists but nobody bids for the held side: worth 0. Both NULL (closed
+                                        # or settled market, empty book) stays unknown and is left out
             if exit_px is not None:
                 pnl += n * exit_px - cost - fee
         return pnl

@@ -206,8 +206,17 @@ async def _trades(db: sqlite3.Connection, include_synthetic: bool, book: str = "
 
         book = books.get(r["market_id"])
         now_px = None
+        no_bid = False
         if book is not None:
             now_px = _held_bid(side, book.bid("yes"), book.best("yes"))
+            if now_px is None or now_px <= 0:
+                # Worth 0 only when the market is alive on the held side (asks exist, no bid). A completely empty book is
+                # a closed or settled market (or nothing quoted): unknown, like a fetch failure, never a -100% loss.
+                held_asks = book.yes_asks if side == "yes" else book.no_asks
+                if held_asks:
+                    now_px, no_bid = 0.0, True
+                else:
+                    now_px = None
             if now_px is not None:
                 path.append({"ts": now, "price": now_px})
         path.sort(key=lambda p: p["ts"])
@@ -223,7 +232,7 @@ async def _trades(db: sqlite3.Connection, include_synthetic: bool, book: str = "
             "venue": r["venue"], "market_id": r["market_id"], "question": r["market_question"],
             "side": side, "contracts": n, "entry_price": r["avg_price"], "best_ask_at_entry": r["best_ask"],
             "cost": r["cost"], "fee": r["fee"], "opened_ts": r["opened_ts"],
-            "now_price": now_px, "value": value, "pnl": pnl,
+            "now_price": now_px, "no_bid": no_bid, "value": value, "pnl": pnl,
             "pnl_pct": (pnl / (r["cost"] + r["fee"]) * 100) if pnl is not None and r["cost"] else None,
             "move_cents": (now_px - r["avg_price"]) * 100 if now_px is not None else None,
             "path": path,

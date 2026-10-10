@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0 - 2026-10-10
+
+### Added
+- FOMC on Polymarket (`fastlane/poly_fomc.py`, series `POLYFED`). Kalshi closes its Fed ladders before 14:00 ET;
+  Polymarket's "Fed Decision in <Month>?" brackets stay open until the end of the decision day. Discovery is a gamma
+  search plus the event slug; a market is accepted only when its question matches one of five captured templates for the
+  meeting's month, its description names the Fed calendar page and the "upper bound", its outcomes are Yes/No, it has two
+  CLOB token ids and it accepts orders. After the statement the engine buys YES on the resolving bracket and NO on at most
+  `POLY_FOMC_MAX_NO` (default 1) dead brackets, `take` entry, LIVE paper book, same sizing and guards, after re-checking
+  `acceptingOrders`/`closed` and a fresh two-sided CLOB book. `POLY_FOMC_ENABLED`, `POLY_FOMC_MAX_NO`.
+- `python3 -m fastlane.releases --rehearse fomc`: replays a whole FOMC release on a fake clock against fixtures captured
+  from the live sites (`tests/fixtures/polymarket_fomc/`), with a temp ledger and no network.
+- Table `release_books`: every candidate market's book at the decision and at +5, +30 and +60 s, and the timing of the
+  release (`statement_seen_ts`, `decided_ts`, `first_fill_ts`, polls, GETs) in the release row. Shown by `fastlane.report`.
+- `prior_range` verification at arm time (`prior_range_mismatch`, `prior_range_unverified` refuse to arm); `--check` prints it.
+- Faster FOMC polling: from T-5 s the statement URL and the feed alternate every 0.5 s for a minute, then every 2 s until
+  T+300 s, capped at 500 GETs. The release row is `polling` before the first request and `computed` once a statement parsed.
+- Positions with no bid on the held side are valued at 0 (`/trades` `no_bid: true`, dashboard `no bid`), in every total and
+  in the engine's daily-loss halt, but only while the market is alive on that side (asks exist, no bid). A closed or
+  settled market (empty book, or a mark with both prices NULL) stays unknown, like a fetch failure.
+- POLYFED refuses an entry whose `date` is not in its `period` (`period_date_mismatch`), a market whose description does not
+  name "<Month> <Year> meeting" (`description_other_meeting`), and an event with two markets for one bracket.
+- A second SIGINT or SIGTERM during a slow shutdown forces exit.
+- Clean shutdown: SIGTERM and SIGINT stop the engine through `Engine.stop()`, which clears the heartbeat.
+
+### Changed
+- `MOVE_DENY_RE` default also denies count and tally ladders (posts, tweets, mentions today/on a date/this week, "how many
+  times", "Truth Social posts", series tickers `KXTRUTHSOCIAL*`, `KXTWEETS*`, `KXMENTION*`, `KXSAYS*` ending at the series
+  boundary, so "banned from Truth Social" or a ticker like `KXSAYDEBTCEILING` is not denied). Such markets are also dropped as candidates of move events (news
+  events keep them).
+- FOMC release statuses and the done note (`<n> traded, <n> skipped`); the X poller start line says `Mon-Fri` instead of a
+  weekday count; `--minutes` help text; `Engine(ledger=None, jev=None)`; `trade_release(style=)`.
+- Real trading (`fastlane/live.py`) unchanged; Polymarket trades remain paper only (no Polymarket order code exists).
+
 ## 0.5.0 - 2026-10-10
 
 ### Added

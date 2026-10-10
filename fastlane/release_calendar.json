@@ -6,7 +6,7 @@
   "fomc": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
  },
  "notes": {
-  "fomc": "Meeting dates (decision day, 2:00 PM ET statement) copied from the federalreserve.gov FOMC calendar page; the 2027 dates are marked tentative there. prior_range is filled only for the next meeting (from the 2026-09-16 statement: 3-3/4 to 4 percent); for later meetings it depends on the earlier decisions, so KXFEDDECISION stays skipped until the owner adds it after each meeting.",
+  "fomc": "Meeting dates (decision day, 2:00 PM ET statement) copied from the federalreserve.gov FOMC calendar page; the 2027 dates are marked tentative there. prior_range is filled only for the next meeting (from the 2026-09-16 statement: 3-3/4 to 4 percent); for later meetings it depends on the earlier decisions, so KXFEDDECISION and POLYFED stay skipped until the owner adds it after each meeting.",
   "bls": "CPI and Employment Situation dates copied from bls.gov/schedule/news_release/cpi.htm and empsit.htm, fetched 2026-10-10. Release time 08:30 ET; period is the reference month. No September 2026 CPI entry: bls.gov lists no date for it yet. Never guess a date; add new rows only from the BLS schedule pages.",
   "entry": "Entry: {kind: cpi|jobs|fomc, date: YYYY-MM-DD (ET), time_et: HH:MM, period: YYYY-MM (the reference month; fomc: the meeting month), prior_range: [lo, hi] (fomc only, percent, from the previous statement)}. The engine refuses to arm a release without an entry."
  },

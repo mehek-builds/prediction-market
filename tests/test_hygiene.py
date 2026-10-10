@@ -117,7 +117,8 @@ def test_env_example_has_no_values_and_all_vars():
                 "POST_MAX_WAIT_S", "POST_POLL_S", "POST_MAX_WORKING", "STARTER_ENABLED", "STARTER_SIGNAL_THRESHOLD",
                 "STARTER_DECISIVE_MIN", "STARTER_SIZE_USD", "RELEASES_ENABLED", "BLS_API_KEY", "RELEASE_POLL_START_S",
                 "RELEASE_POLL_EVERY_S", "RELEASE_POLL_MAX_S", "RELEASE_BLS_DAILY_BUDGET", "RELEASE_MARGIN_CPI_PP",
-                "RELEASE_MARGIN_PAYROLLS_K", "RELEASE_MAX_MARKETS_PER_SERIES"]:
+                "RELEASE_MARGIN_PAYROLLS_K", "RELEASE_MAX_MARKETS_PER_SERIES",
+                "POLY_FOMC_ENABLED", "POLY_FOMC_MAX_NO"]:
         assert re.search(rf"^{var}=", text, re.M), var
     for gone in ["KALSHI_ENV", "X_BEARER_TOKEN", "X_LIST_ID"]:
         assert gone not in text
@@ -129,10 +130,10 @@ def test_version_matches_changelog_head():
     assert head == fastlane.__version__
 
 
-def test_version_is_0_5_0():
+def test_version_is_0_6_0():
     import fastlane
-    assert fastlane.__version__ == "0.5.0"
-    assert re.search(r"^## 0\.5\.0 - \d{4}-\d{2}-\d{2}$", (ROOT / "CHANGELOG.md").read_text(), re.M)
+    assert fastlane.__version__ == "0.6.0"
+    assert re.search(r"^## 0\.6\.0 - \d{4}-\d{2}-\d{2}$", (ROOT / "CHANGELOG.md").read_text(), re.M)
 
 
 def test_release_calendar_parses_and_keeps_its_todo_when_it_has_empty_kinds():
@@ -156,7 +157,7 @@ def test_release_fixtures_are_committed_for_every_series():
 
 
 def test_new_modules_make_no_non_get_requests():
-    for name in ("releases.py", "orders.py", "replay.py"):
+    for name in ("releases.py", "orders.py", "replay.py", "poly_fomc.py"):
         text = (ROOT / "fastlane" / name).read_text()
         assert not re.search(r"\.(post|put|delete|patch|request)\(", text), name
         assert not re.search(r"[\"']POST[\"']", text), name

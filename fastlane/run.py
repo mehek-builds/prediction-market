@@ -1,6 +1,6 @@
 """Run the fast lane (paper only).
 
-    python3 -m fastlane.run                     # live, forever (Ctrl-C to stop)
+    python3 -m fastlane.run                     # live, forever (Ctrl-C or SIGTERM to stop)
     python3 -m fastlane.run --minutes 30        # live for 30 minutes
     python3 -m fastlane.run --inject "Fed cuts rates by 50 bps" --minutes 2   # synthetic end-to-end test
     python3 -m fastlane.run --vercel            # also keep a password-protected copy of the dashboard on Vercel
@@ -19,7 +19,7 @@ from fastlane.config import load_env
 load_env()
 
 from fastlane import errors  # noqa: E402
-from fastlane.engine import Engine  # noqa: E402
+from fastlane.engine import Engine, install_stop_signals  # noqa: E402
 
 
 async def main(a):
@@ -31,6 +31,8 @@ async def main(a):
             deploy.refuse_if_demo()
         except deploy.DeployError as exc:
             sys.exit(f"error: {exc}")
+    stop = asyncio.Event()
+    install_stop_signals(asyncio.get_running_loop(), stop)
     eng = Engine(workers=a.workers)
     await eng.start(feeds=not a.inject)
     if a.vercel:
@@ -43,16 +45,22 @@ async def main(a):
                   "published_ts": time.time(), "seen_ts": time.time(), "synthetic": True}
             await eng.handle(ev)
         deadline = time.time() + a.minutes * 60 if a.minutes else None
-        while deadline is None or time.time() < deadline:
-            await asyncio.sleep(min(60, max(1, (deadline or time.time() + 60) - time.time())))
-            print(eng.status())
+        while not stop.is_set() and (deadline is None or time.time() < deadline):
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=min(60, max(1, (deadline or time.time() + 60) - time.time())))
+            except asyncio.TimeoutError:
+                print(eng.status())
+        if stop.is_set():
+            print("stopping (signal)")
     finally:
+        # LiveTrader.stop writes heartbeat_ts 0: an immediate restart does not wait 60 s for the old engine to look dead
         await eng.stop()
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--minutes", type=float, default=0)
+    ap.add_argument("--minutes", type=float, default=0,
+                    help="run this many minutes then stop (default: forever, until Ctrl-C or SIGTERM)")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--inject", action="append", help="synthetic headline (repeatable); disables live feeds")
     ap.add_argument("--vercel", type=float, nargs="?", const=30, metavar="MINUTES",
