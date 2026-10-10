@@ -410,11 +410,11 @@ def test_shadow_toggle_rejects_large_content_length_first(seeded, monkeypatch):
     def tripwire_stream(self):
         reads.append(1)
         raise AssertionError("request body was consumed before the 413")
-    monkeypatch.setattr(Request, "body", tripwire)
-    monkeypatch.setattr(Request, "stream", tripwire_stream)
-    r = c.post("/settings/shadow", content=b"x" * 1000, headers={**CTRL, "Content-Type": "application/json"})
+    with monkeypatch.context() as m:
+        m.setattr(Request, "body", tripwire)
+        m.setattr(Request, "stream", tripwire_stream)
+        r = c.post("/settings/shadow", content=b"x" * 1000, headers={**CTRL, "Content-Type": "application/json"})
     assert r.status_code == 413 and reads == []
-    monkeypatch.undo()
     assert c.get("/settings").json()["source"] == "env"
 
 
@@ -530,11 +530,11 @@ def test_write_routes_reject_oversize_before_reading_the_body(seeded, monkeypatc
     def tripwire_stream(self):
         reads.append(1)
         raise AssertionError("body read before the 413")
-    monkeypatch.setattr(Request, "body", tripwire)
-    monkeypatch.setattr(Request, "stream", tripwire_stream)
-    r = c.post(route, content=b"x" * 9999, headers={**CTRL, **JSON_CT})
+    with monkeypatch.context() as m:   # undo only the tripwires; monkeypatch.undo() would also drop the autouse path redirects
+        m.setattr(Request, "body", tripwire)
+        m.setattr(Request, "stream", tripwire_stream)
+        r = c.post(route, content=b"x" * 9999, headers={**CTRL, **JSON_CT})
     assert r.status_code == 413 and reads == []
-    monkeypatch.undo()
     _nothing_written(c)
 
 

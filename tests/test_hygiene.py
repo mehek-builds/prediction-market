@@ -130,10 +130,10 @@ def test_version_matches_changelog_head():
     assert head == fastlane.__version__
 
 
-def test_version_is_0_6_0():
+def test_version_is_0_6_1():
     import fastlane
-    assert fastlane.__version__ == "0.6.0"
-    assert re.search(r"^## 0\.6\.0 - \d{4}-\d{2}-\d{2}$", (ROOT / "CHANGELOG.md").read_text(), re.M)
+    assert fastlane.__version__ == "0.6.1"
+    assert re.search(r"^## 0\.6\.1 - \d{4}-\d{2}-\d{2}$", (ROOT / "CHANGELOG.md").read_text(), re.M)
 
 
 def test_release_calendar_parses_and_keeps_its_todo_when_it_has_empty_kinds():

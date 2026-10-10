@@ -107,8 +107,10 @@ def _requirements() -> str:
     return "\n".join(l for l in lines if l and not l.startswith(("#", "pytest"))) + "\n"
 
 
-def build(project: str, password_hash: dict, src_db: Path = DB_PATH, out_root: Path = BUILD_ROOT) -> Path:
+def build(project: str, password_hash: dict, src_db: Path | None = None, out_root: Path | None = None) -> Path:
     """Assemble the deployable folder. Keeps .vercel/ (the project link) between builds."""
+    src_db = DB_PATH if src_db is None else src_db
+    out_root = BUILD_ROOT if out_root is None else out_root
     out = out_root / project
     out.mkdir(parents=True, exist_ok=True)
     for child in out.iterdir():
@@ -140,8 +142,9 @@ def build(project: str, password_hash: dict, src_db: Path = DB_PATH, out_root: P
     return out
 
 
-def ledger_fingerprint(db_path: Path = DB_PATH) -> str:
+def ledger_fingerprint(db_path: Path | None = None) -> str:
     """Changes whenever the ledger gains rows; cheap enough to check every few minutes."""
+    db_path = DB_PATH if db_path is None else db_path
     import sqlite3
     if not db_path.exists():
         return ""

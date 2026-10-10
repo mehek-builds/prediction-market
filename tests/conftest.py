@@ -1,6 +1,8 @@
 import base64
 import os
 import sqlite3
+import sys
+from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -54,14 +56,83 @@ CREATE TABLE IF NOT EXISTS marks (
 """  # the v0.1.1 ledger schema, kept verbatim to test migration and read-only API tolerance
 
 
+def _real_results_dirs() -> list[Path]:
+    from fastlane import config
+    return [config.PKG / "results", config.PKG / "results-demo"]   # PKG is never redirected; RESULTS_DIR is one of these
+
+
+def snapshot_tree(root: Path) -> dict[str, tuple[int, int]] | None:
+    """{relative path: (size, mtime_ns)} for every file and folder under root, or None when root does not exist."""
+    if not root.exists():
+        return None
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = Path(dirpath) / name
+            try:
+                st = path.lstat()
+            except OSError:
+                continue
+            out[str(path.relative_to(root))] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def snapshot_diff(before: dict | None, after: dict | None) -> list[str]:
+    if before is None and after is None:
+        return []
+    if before is None:
+        return ["folder was created"] + sorted(f"created: {k}" for k in after)
+    if after is None:
+        return ["folder was removed"]
+    return sorted([f"created: {k}" for k in after.keys() - before.keys()]
+                  + [f"removed: {k}" for k in before.keys() - after.keys()]
+                  + [f"changed: {k}" for k in before.keys() & after.keys() if before[k] != after[k]])
+
+
+_REAL_BEFORE: dict[Path, dict | None] = {}
+
+
+def pytest_sessionstart(session):
+    """Guard: the suite must never touch the real results folder. Snapshot it now, compare in sessionfinish."""
+    _REAL_BEFORE.clear()
+    for d in _real_results_dirs():
+        _REAL_BEFORE[d] = snapshot_tree(d)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    problems = []
+    for d, before in _REAL_BEFORE.items():
+        problems += [f"{d}: {line}" for line in snapshot_diff(before, snapshot_tree(d))]
+    if problems:
+        print("\nFAIL: the test run touched the real results folder:\n  " + "\n  ".join(problems[:20]), file=sys.stderr)
+        session.exitstatus = 1
+
+
+def redirect_results_paths(monkeypatch, root: Path) -> None:
+    """Point every module-level Path under a real results folder (ledger, universe cache, mode/engine files, errors
+    log, backup, deploy state and build dirs, ...) at the same relative place under `root`. Walks every imported
+    fastlane module, so a constant added later is covered without editing this list."""
+    from fastlane import api, backup, bench_jev, config, deploy, errors, ledger, live, replay, report, universe  # noqa: F401
+    real = _real_results_dirs()
+    for mod in [m for name, m in list(sys.modules.items()) if name == "fastlane" or name.startswith("fastlane.")]:
+        for attr, value in list(vars(mod).items()):
+            if not isinstance(value, Path):
+                continue
+            for r in real:
+                if value == r or r in value.parents:
+                    monkeypatch.setattr(mod, attr, root / r.name / value.relative_to(r))
+                    break
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch, tmp_path):
-    """Host env must never leak into tests, and tests never write into the real results directory."""
+    """Host env must never leak into tests, and tests never read or write the real results directory."""
     from fastlane import api, backup, errors, live
     api.app.middleware_stack = None  # rebuilt on the next request: fresh rate-limit buckets per test
     for name in _ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("FASTLANE_TELEMETRY", "0")
+    redirect_results_paths(monkeypatch, tmp_path)   # nothing is created here: a fresh checkout has no results folder
     monkeypatch.setattr(live, "MODE_FILE", tmp_path / "trading_mode.json")
     monkeypatch.setattr(live, "ENGINE_FILE", tmp_path / "engine_state.json")
     monkeypatch.setattr(backup, "DB_PATH", tmp_path / "no-such-ledger.db")

@@ -448,8 +448,8 @@ Why: Kalshi closes its Fed ladders before 14:00 ET, but Polymarket's "Fed Decisi
 - `prior_range` check: at arm time (`T - 120 s`) the calendar's `prior_range` must equal the new range in the newest
   earlier "FOMC statement" in the Fed feed. A disagreement refuses to arm (`prior_range_mismatch`), and so does an
   unreachable feed or an unparseable page (`prior_range_unverified`): the whole FOMC path depends on that feed anyway.
-- Shutdown: the first SIGINT or SIGTERM stops the engine and restores the default handlers, so a second Ctrl-C during a
-  slow shutdown forces exit. A signal sent while the engine is still starting is honoured once start returns.
+- Shutdown: the first SIGINT or SIGTERM stops the engine and restores the default handlers. A second SIGTERM exits
+  immediately. A second Ctrl-C may wait for a running backup thread before the process exits. A signal sent while the engine is still starting is honoured once start returns.
 - A release that crashed mid-run is `already_started` and is skipped on restart. Manual reset, only BEFORE the release time:
   `sqlite3 fastlane/results/ledger.db "DELETE FROM releases WHERE id='fomc-2026-10'"` (use the release id `<kind>-<period>`).
   Never delete it after T: the engine could buy a second market.

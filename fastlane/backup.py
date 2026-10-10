@@ -72,8 +72,9 @@ def _snapshot(src: Path, dest: Path) -> dict[str, int]:
         d.close()
 
 
-def snapshot(dest: Path, src: Path = DB_PATH) -> dict[str, int]:
+def snapshot(dest: Path, src: Path | None = None) -> dict[str, int]:
     """A plain, uncompressed snapshot (the Vercel deploy uses this)."""
+    src = DB_PATH if src is None else src
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".tmp")
     tmp.unlink(missing_ok=True)
@@ -82,8 +83,9 @@ def snapshot(dest: Path, src: Path = DB_PATH) -> dict[str, int]:
     return counts
 
 
-def backup(src: Path = DB_PATH, out_dir: Path | None = None, keep: int | None = None) -> Path:
+def backup(src: Path | None = None, out_dir: Path | None = None, keep: int | None = None) -> Path:
     """Write <out_dir>/ledger-YYYYmmdd-HHMMSS.db.gz plus a .json manifest, prune old ones. Returns the backup path."""
+    src = DB_PATH if src is None else src
     if not src.exists():
         raise FileNotFoundError(f"no ledger at {src}")
     out_dir = out_dir or backup_dir()
@@ -193,9 +195,10 @@ def carry_live_orders(staged: Path, current: Path) -> int:
         db.close()
 
 
-def restore(path: Path, db_path: Path = DB_PATH) -> Path | None:
+def restore(path: Path, db_path: Path | None = None) -> Path | None:
     """Replace the ledger with a backup. The current ledger is kept as ledger.db.pre-restore-<stamp>.
     Real-order rows (live_orders) of the current ledger are carried over, so the real-money caps never reset."""
+    db_path = DB_PATH if db_path is None else db_path
     from fastlane import live
     if live.engine_alive(live.read_engine()):
         raise RuntimeError("the engine is running: stop it first (python3 -m fastlane.run), then restore")

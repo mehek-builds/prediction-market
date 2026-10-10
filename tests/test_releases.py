@@ -194,12 +194,12 @@ def test_malformed_entry_names_its_index(tmp_path):
     for bad, msg in [({**good, "kind": "gdp"}, "events[1]"), ({**good, "date": "2026-13-01"}, "events[1]"),
                      ({**good, "time_et": "8:30"}, "events[1]"), ({**good, "period": "2026-9"}, "events[1]"),
                      ({**good, "prior_range": [3.75, 4.0]}, "fomc entries only"),
-                     ({**good, "kind": "fomc", "prior_range": [4.0, 3.75]}, "prior_range"),
+                     ({**good, "kind": "fomc", "period": "2026-10", "prior_range": [4.0, 3.75]}, "prior_range"),
                      ({**good, "extra": 1}, "unknown keys"), ("nope", "events[1]")]:
         with pytest.raises(ValueError, match="events\\[1\\]|fomc entries|prior_range|unknown keys") as ei:
             load_calendar(write_cal(tmp_path, [good, bad]))
         assert msg in str(ei.value)
-    load_calendar(write_cal(tmp_path, [good, {**good, "kind": "fomc", "prior_range": [3.75, 4.0]}]))
+    load_calendar(write_cal(tmp_path, [good, {**good, "kind": "fomc", "period": "2026-10", "prior_range": [3.75, 4.0]}]))
 
 
 def test_calendar_file_errors_are_value_errors(tmp_path):
@@ -1160,3 +1160,31 @@ def test_a_slow_bls_answer_never_causes_back_to_back_polls(tmp_ledger):
     rounds = sorted({round(t, 1) for t in calls[6:]})
     gaps = [b - a for a, b in zip(rounds, rounds[1:])]
     assert gaps and min(gaps) >= 1.4
+
+
+def test_release_decision_row_and_first_mark_exist_before_the_real_order_is_sent(monkeypatch, tmp_path, tiny_universe, rsa_pem):
+    seen = []
+
+    class Spy(Recorder):
+        def __call__(self, request):
+            db = e.ledger.db
+            seen.append((db.execute("SELECT COUNT(*) FROM decisions WHERE event_id=?", (ev["id"],)).fetchone()[0],
+                         db.execute("SELECT COUNT(*) FROM marks WHERE event_id=? AND horizon_s=0", (ev["id"],)).fetchone()[0],
+                         db.execute("SELECT COUNT(*) FROM trades WHERE book='live'").fetchone()[0]))
+            return super().__call__(request)
+
+    spy = Spy(FILLED)
+    e = _live_engine(monkeypatch, tmp_path, tiny_universe, rsa_pem, spy)
+    live.arm(e.live.session)
+    ev = _release_ev()
+    _trade_release(e, ev)
+    assert len(spy.requests) == 1 and seen == [(1, 1, 1)]   # paper trade, decision row and first mark all precede the order
+
+
+def test_fomc_calendar_entry_with_a_period_that_is_not_the_dates_month_is_rejected():
+    from fastlane.releases import _entry
+    ok = {"kind": "fomc", "date": "2026-10-28", "time_et": "14:00", "period": "2026-10"}
+    assert _entry(0, ok).period == "2026-10"
+    with pytest.raises(ValueError, match="events\\[3\\].*period 2026-12 must be the month of date 2026-10-28"):
+        _entry(3, {**ok, "period": "2026-12"})
+    assert _entry(0, {"kind": "cpi", "date": "2026-10-14", "time_et": "08:30", "period": "2026-09"}).period == "2026-09"

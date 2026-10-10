@@ -158,7 +158,8 @@ def columns(db: sqlite3.Connection, table: str) -> set[str]:
 
 
 class Ledger:
-    def __init__(self, path: Path = DB_PATH):
+    def __init__(self, path: Path | None = None):
+        path = DB_PATH if path is None else path   # read at call time, so a test can point DB_PATH at a temp folder
         path.parent.mkdir(exist_ok=True)
         self.path = path
         self.db = sqlite3.connect(path, isolation_level=None)

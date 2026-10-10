@@ -420,9 +420,9 @@ def test_engine_start_line_uses_the_label_not_a_count():
 # ---------------------------------------------------------------- hygiene
 def test_version_changelog_head_and_rollback_line():
     import fastlane
-    assert fastlane.__version__ == "0.6.0"
+    assert fastlane.__version__ == "0.6.1"
     heads = re.findall(r"^## (\d+\.\d+\.\d+) - \d{4}-\d{2}-\d{2}$", (ROOT / "CHANGELOG.md").read_text(), re.M)
-    assert heads[0] == "0.6.0"
+    assert heads[0] == "0.6.1" and heads[1] == "0.6.0"
     assert "POLY_FOMC" in (ROOT / "ROLLBACK.md").read_text() or "0.6.0" in (ROOT / "ROLLBACK.md").read_text()
 
 

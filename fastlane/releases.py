@@ -213,6 +213,8 @@ def _entry(i: int, raw) -> CalendarEntry:
         raise bad("time_et must be HH:MM")
     if not (isinstance(p, str) and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", p)):
         raise bad("period must be YYYY-MM")
+    if kind == "fomc" and d[:7] != p:   # every FOMC series keys its markets on the period, so it must be the meeting's month
+        raise bad(f"fomc period {p} must be the month of date {d}")
     pr = raw.get("prior_range")
     prior = None
     if pr is not None:

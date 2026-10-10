@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.1 - 2026-10-10
+
+### Fixed
+- The test suite no longer reads or writes the real `fastlane/results/` folder. Two API tests failed in a checkout that
+  had a real results folder, because they called `monkeypatch.undo()`, which also dropped the autouse path redirects.
+  An autouse fixture now points every module-level path under a results folder (ledger, universe cache, mode and engine
+  files, errors log, backup, deploy state and build dirs) at the test's temp folder, found by walking the imported
+  `fastlane` modules. The default paths of `Ledger()`, `backup.snapshot/backup/restore` and `deploy.build/ledger_fingerprint`
+  are now read at call time instead of at import. Behavior at runtime is unchanged.
+- A session guard in `tests/conftest.py` snapshots the real results folders before the run and fails the run if anything
+  in them was created, changed or removed.
+
+### Changed
+- `release_calendar.json` validation applies the period/date check to every `fomc` entry: `period` must be the month of
+  `date`.
+
+### Tests
+- `trade_release` writes the decision row and the first mark before the real-order request is sent.
+- README: a second SIGTERM exits immediately, a second Ctrl-C may wait for a running backup thread.
+
 ## 0.6.0 - 2026-10-10
 
 ### Added
